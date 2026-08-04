@@ -62,7 +62,67 @@ sudo apt install python3-vcstool     # 没装的话
 ./tools/setup_upstream.sh
 ```
 
-脚本做三件事：按 `upstream.repos` 锁定的 commit 拉 8 个上游仓库到 `src/`、初始化 pb2025_sentry_nav 的 7 个子模块、给 5 个 `CMakeLists.txt` 打补丁（删掉 `USE_SCOPED_HEADER_INSTALL_DIR`，上游用的 ament_cmake_auto 版本不支持这个选项，留着编译会失败）。脚本是幂等的，重复跑没问题。
+脚本做三件事，幂等，重复跑没问题：
+
+1. 按 `upstream.repos` 锁定的 commit 拉 8 个上游仓库到 `src/`
+2. 初始化 `pb2025_sentry_nav` 的 7 个子模块
+3. 给 9 个 `CMakeLists.txt` 打补丁
+
+跑完之后 `src/` 下应该有 9 个目录（8 个上游 + `astra`）。
+
+#### 脚本做了什么（手动执行的话照这个来）
+
+不想用脚本，或者脚本某一步失败要单独重试，可以直接敲这三步。
+
+拉上游，`vcs` 会读 `upstream.repos` 里锁定的 commit，所以拿到的版本和开发时完全一致：
+
+```bash
+vcs import src < upstream.repos
+```
+
+`pb2025_sentry_nav` 自己还带 7 个子模块（point_lio、small_gicp_relocalization、livox_ros_driver2、pointcloud_to_laserscan、pb_nav2_plugins、pb_omni_pid_pursuit_controller、pb_teleop_twist_joy），必须单独初始化，漏了会编译失败：
+
+```bash
+git -C src/pb2025_sentry_nav submodule update --init --recursive
+```
+
+打补丁——删掉 9 个 `CMakeLists.txt` 里的 `USE_SCOPED_HEADER_INSTALL_DIR`。上游用的 ament_cmake_auto 版本不认这个选项，留着编译直接报错。这是本工程对上游的**全部**改动，每个文件就删这一行。注意其中 4 个在子模块里，所以必须先跑完上一步的 `submodule update`：
+
+```bash
+sed -i '/USE_SCOPED_HEADER_INSTALL_DIR/d' \
+  src/pb2025_sentry_nav/fake_vel_transform/CMakeLists.txt \
+  src/pb2025_sentry_nav/ign_sim_pointcloud_tool/CMakeLists.txt \
+  src/pb2025_sentry_nav/loam_interface/CMakeLists.txt \
+  src/pb2025_sentry_nav/sensor_scan_generation/CMakeLists.txt \
+  src/pb2025_sentry_nav/pb_nav2_plugins/CMakeLists.txt \
+  src/pb2025_sentry_nav/pb_omni_pid_pursuit_controller/CMakeLists.txt \
+  src/pb2025_sentry_nav/pb_teleop_twist_joy/CMakeLists.txt \
+  src/pb2025_sentry_nav/small_gicp_relocalization/CMakeLists.txt \
+  src/rmu_gazebo_simulator/rmu_gazebo_simulator/CMakeLists.txt
+```
+
+验证补丁生效，下面这条应该输出 `0`：
+
+```bash
+grep -rc USE_SCOPED_HEADER_INSTALL_DIR src/ | grep -v ':0$' | wc -l
+```
+
+#### 上游版本对照
+
+`upstream.repos` 里锁的 commit：
+
+| 仓库 | commit |
+| --- | --- |
+| pb2025_sentry_nav | `7ed5f10` |
+| rmu_gazebo_simulator | `c950a93` |
+| rmoss_core | `8209ec5` |
+| rmoss_gazebo | `7443ff0` |
+| rmoss_interfaces | `424f50c` |
+| rmoss_gz_resources | `b5c759f` |
+| pb2025_robot_description | `a0541dd` |
+| sdformat_tools | `47c2d1a` |
+
+想换成上游最新版，把 `version:` 改成分支名（比如 `main`）重新 `vcs import`，但上游接口变动可能需要相应改胶水层。
 
 ### 2. 下载先验点云
 
