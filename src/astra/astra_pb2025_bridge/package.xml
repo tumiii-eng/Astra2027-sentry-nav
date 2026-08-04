@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_pb2025_bridge</name>
+  <version>0.1.0</version>
+  <description>把 Astra 规划/控制层接入 pb2025 仿真栈的联合 launch 与参数覆盖（复用 pb2025 定位/感知/TF/RViz，替换 nav2 planner/controller）。不修改 Astra 与 pb2025 源码。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>astra_mapping</exec_depend>
+  <exec_depend>astra_planning</exec_depend>
+  <exec_depend>astra_control</exec_depend>
+  <exec_depend>astra_localization</exec_depend>
+  <exec_depend>pb2025_nav_bringup</exec_depend>
+  <exec_depend>ign_sim_pointcloud_tool</exec_depend>
+  <exec_depend>loam_interface</exec_depend>
+  <exec_depend>sensor_scan_generation</exec_depend>
+  <exec_depend>terrain_analysis</exec_depend>
+  <exec_depend>fake_vel_transform</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

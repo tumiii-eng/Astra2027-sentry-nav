@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_localization</name>
+  <version>0.1.0</version>
+  <description>定位功能包（对应报告 5.1 与 5.2）：当前为 Batch-LIWO 里程计接口代理节点，后续替换为完整 C++ 里程计实现。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

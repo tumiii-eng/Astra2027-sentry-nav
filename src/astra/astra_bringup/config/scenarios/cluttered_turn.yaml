@@ -1,0 +1,14 @@
+sim_world_node:
+  ros__parameters:
+    scenario_name: 杂障转弯
+    obstacle_layout: cluttered
+    initial_x: -0.3
+    initial_y: -0.2
+    initial_yaw: 0.35
+    motion_enabled: true
+    goal_x: 5.2
+    goal_y: 2.2
+
+planner_node:
+  ros__parameters:
+    local_goal_backoff_distance: 0.45

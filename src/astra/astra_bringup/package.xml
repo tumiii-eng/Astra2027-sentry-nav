@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_bringup</name>
+  <version>0.1.0</version>
+  <description>启动与参数功能包：聚合各功能包节点的 launch 文件与基础/场景参数配置。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>astra_localization</exec_depend>
+  <exec_depend>astra_perception</exec_depend>
+  <exec_depend>astra_mapping</exec_depend>
+  <exec_depend>astra_planning</exec_depend>
+  <exec_depend>astra_control</exec_depend>
+  <exec_depend>astra_simulation</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

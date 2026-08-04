@@ -1,0 +1,23 @@
+# colcon 构建产物
+/build/
+/install/
+/log/
+
+# 上游依赖仓库（由 tools/setup_upstream.sh 拉取，不进版本库）
+/src/pb2025_sentry_nav/
+/src/rmu_gazebo_simulator/
+/src/rmoss_core/
+/src/rmoss_gazebo/
+/src/rmoss_interfaces/
+/src/rmoss_gz_resources/
+/src/pb2025_robot_description/
+/src/sdformat_tools/
+
+# 先验点云地图，体积太大，从网盘下载
+*.pcd
+
+__pycache__/
+*.pyc
+*~
+.vscode/
+.cache/

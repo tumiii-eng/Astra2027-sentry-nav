@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_control</name>
+  <version>0.1.0</version>
+  <description>控制功能包（对应报告 5.5.5）：轨迹跟踪控制器与底盘速度指令输出。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>astra_common</depend>
+  <depend>astra_planning</depend>
+  <depend>astra_third_party</depend>
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <build_depend>eigen</build_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

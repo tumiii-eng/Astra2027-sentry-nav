@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_simulation</name>
+  <version>0.1.0</version>
+  <description>仿真功能包：工程内轻量仿真世界节点，发布仿真点云、里程计与目标点，用于无实物雷达时的链路验证。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>astra_common</depend>
+  <depend>astra_perception</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

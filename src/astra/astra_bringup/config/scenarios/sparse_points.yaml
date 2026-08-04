@@ -1,0 +1,18 @@
+sim_world_node:
+  ros__parameters:
+    scenario_name: 稀疏点云
+    obstacle_layout: narrow_passage
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_yaw: 0.0
+    motion_enabled: true
+    goal_x: 5.0
+    goal_y: 2.4
+    point_rate_hz: 3.0
+    max_range: 4.0
+
+occupancy_node:
+  ros__parameters:
+    fade_ticks: 18
+    max_points_per_update: 700
+

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_third_party</name>
+  <version>0.1.0</version>
+  <description>第三方头文件副本：GCOPTER / DDR-opt 派生的二维 MINCO、L-BFGS、轨迹与求根头文件（仅头文件，原 MIT 许可保留）。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <build_depend>eigen</build_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

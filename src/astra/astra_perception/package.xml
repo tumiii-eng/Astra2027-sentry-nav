@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_perception</name>
+  <version>0.1.0</version>
+  <description>感知功能包（对应报告 5.3）：点云预处理与三维滚动占据栅格。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>astra_common</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <build_depend>eigen</build_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

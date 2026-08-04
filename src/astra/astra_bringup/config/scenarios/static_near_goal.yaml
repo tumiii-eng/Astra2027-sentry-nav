@@ -1,0 +1,16 @@
+sim_world_node:
+  ros__parameters:
+    scenario_name: 静止近目标
+    obstacle_layout: open_field
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_yaw: 0.0
+    motion_enabled: false
+    goal_x: 0.15
+    goal_y: 0.0
+
+controller_node:
+  ros__parameters:
+    tracking_error_warn_threshold: 0.12
+    tracking_velocity_error_warn_threshold: 0.15
+

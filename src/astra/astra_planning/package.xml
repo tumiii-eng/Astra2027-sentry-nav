@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>astra_planning</name>
+  <version>0.1.0</version>
+  <description>规划功能包（对应报告 5.5.3 与 5.5.4）：JPS 前端、局部子目标、起终点清障、MINCO 轨迹表示与 L-BFGS 优化、重规划。</description>
+  <maintainer email="tumi@example.com">tumi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>astra_common</depend>
+  <depend>astra_mapping</depend>
+  <depend>astra_third_party</depend>
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <build_depend>eigen</build_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

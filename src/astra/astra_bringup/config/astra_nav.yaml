@@ -1,0 +1,154 @@
+astra_nav:
+  ros__parameters:
+    map_frame: odom
+    robot_frame: base_link
+    lidar_frame: lidar
+
+sim_world_node:
+  ros__parameters:
+    update_rate_hz: 20.0
+    point_rate_hz: 10.0
+    goal_x: 5.0
+    goal_y: 2.4
+    max_range: 8.0
+    obstacle_height: 0.8
+    point_noise_std: 0.01
+
+batch_liwo_proxy_node:
+  ros__parameters:
+    input_odom_topic: /sim/odom
+    output_odom_topic: /astra/odom
+    use_input_twist: true
+
+occupancy_node:
+  ros__parameters:
+    point_topic: /points
+    odom_topic: /astra/odom
+    obstacle_grid_topic: /astra/obstacle_grid
+    map_frame: odom
+    resolution: 0.1
+    size_x: 10.0
+    size_y: 10.0
+    size_z: 1.2
+    z_min: -0.15
+    log_odds_hit: 0.85
+    log_odds_miss: -0.35
+    occupied_threshold: 0.6
+    fade_ticks: 35
+    max_points_per_update: 2500
+    height_obstacle_min: 0.18
+    column_occupancy_min: 0.18
+
+planner_node:
+  ros__parameters:
+    odom_topic: /astra/odom
+    obstacle_grid_topic: /astra/obstacle_grid
+    goal_topic: /goal_pose
+    path_topic: /astra/trajectory
+    map_frame: odom
+    robot_radius: 0.28
+    safety_margin: 0.18
+    max_velocity: 1.5
+    max_acceleration: 1.6
+    waypoint_spacing: 0.35
+    dynamic_time_scaling_enabled: true
+    dynamic_time_scaling_max_iterations: 4
+    dynamic_time_scaling_safety_ratio: 1.03
+    replan_rate_hz: 5.0
+    obstacle_cost_radius: 0.55
+    endpoint_projection_enabled: true
+    endpoint_search_radius: 1.2
+    endpoint_angle_samples: 72
+    goal_reachability_enabled: true
+    goal_reachability_search_radius: 1.5
+    local_goal_enabled: true
+    local_goal_backoff_distance: 0.35
+    local_goal_sample_step: 0.1
+    local_goal_min_progress_distance: 0.35
+    replan_start_position_inheritance_enabled: true
+    replan_start_max_position_error: 0.18
+    replan_start_allow_projection_when_unsafe: true
+    replan_start_clearance_hysteresis: 0.04
+    replan_start_transition_enabled: true
+    replan_start_transition_max_position_error: 0.36
+    short_path_hold_distance: 0.25
+    start_projection_escape_enabled: true
+    start_projection_escape_min_distance: 0.28
+    start_projection_escape_speed: 0.25
+    replan_strategy_enabled: true
+    replan_goal_change_threshold: 0.5
+    replan_optimize_only_enabled: true
+    replan_partial_enabled: true
+    replan_collision_clearance: 0.05
+    replan_localization_deviation_threshold: 0.6
+    replan_good_tracking_threshold: 0.25
+
+controller_node:
+  ros__parameters:
+    odom_topic: /astra/odom
+    path_topic: /astra/trajectory
+    cmd_vel_topic: /cmd_vel
+    control_rate_hz: 50.0
+    lookahead_time: 0.18
+    max_linear_velocity: 1.8
+    max_angular_velocity: 2.5
+    position_kp: 1.4
+    heading_kp: 2.2
+    # velocity_damping 现在阻尼【真实速度相对参考速度的超出量】(kd)，实现终点主动刹车(消除过冲/停不稳)。
+    # 0.15→0.6：旧值是配合"阻尼自身上一条命令"(无真实反馈)的软化系数，语义已变，须提到 PD 刹车增益量级。
+    velocity_damping: 0.6
+    path_heading_tracking_enabled: false
+    heading_startup_ramp_time: 0.8
+    heading_error_deadband: 0.03
+    heading_control_min_reference_speed: 0.05
+    arrival_position_tolerance: 0.18
+    arrival_reference_speed_tolerance: 0.05
+    linear_command_accel_limit: 1.2
+    angular_command_accel_limit: 2.0
+    startup_velocity_error_grace_time: 0.6
+    tracking_log_period_ms: 1000
+    tracking_error_warn_threshold: 0.35
+    tracking_velocity_error_warn_threshold: 0.35
+    mpc_preview_enabled: true
+    mpc_preview_steps: 12
+    mpc_preview_dt: 0.05
+    mpc_preview_error_warn_threshold: 0.35
+    # —— 报告 5.5.5 SE(2) MPC-QP 控制器（四全向轮全向底盘）——
+    # controller_type: preview=预瞄原型（默认，兼容旧行为）；mpc=报告 5.5.5 MPC-QP。
+    # 切换为 mpc 即启用稠密 QP（qpOASES）轨迹跟踪控制器。
+    controller_type: preview
+    # 预测时域：步数 × 步长。报告称 40 步时平均 1ms 内完成求解。
+    mpc_horizon: 40
+    mpc_dt: 0.05
+    # 机器人物理参数（待用户按实车标定）。
+    mpc_mass: 15.0            # 总质量 m (kg)
+    mpc_inertia: 0.6         # 绕 Z 轴转动惯量 Iz (kg·m^2)
+    # 状态误差权重 Q（待标定）。
+    mpc_weight_position: 12.0 # 位置 px,py
+    mpc_weight_yaw: 2.0       # 航向 θ
+    mpc_weight_velocity: 1.0  # 速度 vx,vy
+    mpc_weight_omega: 0.2     # 角速度 ω
+    # 控制输入权重 R（待标定）。
+    mpc_weight_force: 0.02    # 力 Fx,Fy
+    mpc_weight_torque: 0.05   # 力矩 Mz
+    # 运动学/动力学约束（待标定）。
+    mpc_max_velocity: 2.0     # |vx|,|vy| 上限 (m/s)
+    mpc_max_omega: 2.5        # |ω| 上限 (rad/s)
+    mpc_max_force: 60.0       # |Fx|,|Fy| 上限 (N)
+    mpc_max_torque: 20.0      # |Mz| 上限 (N·m)
+    mpc_friction_coefficient: 0.8  # 摩擦系数 μ（摩擦圆 |F|≤μmg）
+    mpc_gravity: 9.81
+    mpc_friction_polygon_sides: 8  # 摩擦圆多边形线性化边数
+    # 二次期望轨迹（报告 5.5.5.4.3 横向误差优先）。
+    mpc_secondary_pass_enabled: true
+    mpc_secondary_min_scale: 0.3   # 时间步最小缩放比，越小越偏重横向精度
+    # 输出前瞻（报告 5.5.5.4.4：取 10ms 前瞻速度补偿延迟）。
+    mpc_command_lookahead_time: 0.01
+    # 启动速度下限（报告 5.5.5.6 变通方法，默认 0=关闭）。
+    mpc_startup_speed_floor: 0.0
+    # 到达保持判定。
+    mpc_arrival_position_tolerance: 0.18
+    mpc_arrival_speed_tolerance: 0.05
+    # qpOASES 工作集重计算上限 nWSR。
+    mpc_max_nwsr: 200
+

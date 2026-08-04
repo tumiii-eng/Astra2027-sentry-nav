@@ -1,0 +1,15 @@
+sim_world_node:
+  ros__parameters:
+    scenario_name: 起点近障碍
+    obstacle_layout: near_start
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_yaw: 0.0
+    motion_enabled: true
+    goal_x: 4.2
+    goal_y: 2.0
+
+planner_node:
+  ros__parameters:
+    endpoint_search_radius: 1.5
+

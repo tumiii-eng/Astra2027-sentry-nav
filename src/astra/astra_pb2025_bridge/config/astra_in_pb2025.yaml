@@ -1,0 +1,54 @@
+# Astra 规划/控制层接入 pb2025 仿真栈的参数覆盖（全局 MINCO 版，阶段1+2）。
+# Astra 节点运行在全局命名空间（裸键即可匹配）；话题接线由 launch 的 remap 完成。
+#
+# 全局化关键：一切在 map 帧。
+#  - global_obstacle_map_node 融合先验 /map(静态障碍+手动标注) + 实时 terrain_map(动态) -> 全场障碍图，
+#    并把 odom 帧里程计重投影到 map 帧输出 /astra/odom。
+#  - planner/controller 的 map_frame=map，障碍图=全场全局图 -> ESDF/JPS/MINCO 自然全局化。
+#  - 不再用 occupancy_node(滚动局部图) 与 batch_liwo_proxy(纯透传)，由 global_obstacle_map_node 取代。
+
+global_obstacle_map_node:
+  ros__parameters:
+    use_sim_time: true
+    map_topic: /red_standard_robot1/map          # 先验静态地图(含手动标注)，map 帧
+    terrain_topic: /red_standard_robot1/terrain_map  # 实时动态障碍，odom 帧
+    output_topic: /astra/global_obstacle_grid
+    input_odom_topic: /red_standard_robot1/odometry  # pb2025 odom 帧里程计
+    output_odom_topic: /astra/odom                   # 重投影到 map 帧
+    map_frame: map
+    inflation_radius: 0.0        # 膨胀全部交给 planner 统一做一次(避免双重膨胀切断连通域,见BUG-1)
+    dynamic_intensity_min: 0.1   # terrain_map intensity(离地高)>此值算障碍(对齐 nav2)
+    dynamic_decay_sec: 1.5       # 动态障碍保留时间
+    enable_dynamic: true         # 阶段2:叠加动态障碍;阶段1可临时设 false 只用静态
+    publish_rate_hz: 5.0
+
+planner_node:
+  ros__parameters:
+    use_sim_time: true
+    odom_topic: /astra/odom                       # map 帧(全局图节点重投影)
+    obstacle_grid_topic: /astra/global_obstacle_grid  # 全场全局障碍图
+    goal_topic: /red_standard_robot1/goal_pose    # RViz 2D Goal Pose 工具
+    path_topic: /astra/trajectory
+    map_frame: map
+    # BUG-1 治标：膨胀降到≈机器人半径,单次膨胀(global节点已设0),避免双重膨胀切断窄走廊连通域。
+    robot_radius: 0.25
+    safety_margin: 0.0
+    # BUG-4:把 planner 内部 JPS 真正搜索用的膨胀图发布出来,做到膨胀所见即所得。
+    publish_inflated_grid: true
+    inflated_grid_topic: /astra/planner_inflated_grid
+    # MINCO 两步优化迭代上限=计算预算(5Hz→200ms周期内,实测耗时~20-48ms)。长轨迹按报告 5.5.4.1
+    # 走到迭代上限正常退出(状态-1008,非错误);迭代数越大形状/动力学越精细。
+    minco_pre_iterations: 200
+    minco_fine_iterations: 200
+    # lbfgs_delta 放宽到 1e-4:对应报告 5.5.4.1"放松最终条件 + 参考 DDR-OPT 的 line search 退出条件",
+    # 让代价停滞时能经 LBFGS_STOP 提前正常退出。g_epsilon 用代码默认 1e-5(仅门控梯度收敛退出)。
+    lbfgs_delta: 1.0e-4
+
+controller_node:
+  ros__parameters:
+    use_sim_time: true
+    odom_topic: /astra/odom
+    path_topic: /astra/trajectory
+    cmd_vel_topic: /cmd_vel             # 由 launch remap -> /<ns>/cmd_vel_nav2_result
+    state_estimation_enabled: false
+    controller_type: preview

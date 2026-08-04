@@ -1,0 +1,27 @@
+services:
+  dev:
+    build:
+      context: .
+      args:
+        USER_UID: "${LOCAL_UID:-1000}"
+        USER_GID: "${LOCAL_GID:-1000}"
+    image: pb2025-unified-dev:humble
+    container_name: pb2025-dev
+    network_mode: host
+    ipc: host
+    init: true
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: "${DISPLAY:-:0}"
+      XAUTHORITY: /tmp/.Xauthority
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_DRIVER_CAPABILITIES: all
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - "${HOST_XAUTHORITY:-/run/user/1000/gdm/Xauthority}:/tmp/.Xauthority:ro"
+      - /dev:/dev
+    gpus: all
+    command: sleep infinity

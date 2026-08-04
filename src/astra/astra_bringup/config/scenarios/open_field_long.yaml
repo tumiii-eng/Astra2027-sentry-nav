@@ -1,0 +1,11 @@
+sim_world_node:
+  ros__parameters:
+    scenario_name: 开阔长距离
+    obstacle_layout: open_field
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_yaw: 0.0
+    motion_enabled: true
+    goal_x: 5.5
+    goal_y: 0.0
+
