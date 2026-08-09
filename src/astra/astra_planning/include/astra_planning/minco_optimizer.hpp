@@ -5,15 +5,16 @@
 #include <Eigen/Eigen>
 
 #include "astra_common/common.hpp"
-#include "astra_mapping/esdf_map.hpp"
+#include "astra_mapping/cost_map_sampler.hpp"
 #include "astra_planning/minco_trajectory.hpp"
 
 namespace astra_nav
 {
 
-// MINCO 后端优化阶段：对应报告 5.5.4.2 的两步优化策略。
-// PRE_OPTIMIZATION：障碍梯度各向同性（直接用二次插值梯度），快速得到稳定形状；
-// FINELY_OPTIMIZATION：考虑速度方向，扣除沿轨迹方向分量并按势谷阈值特殊处理，得到良好动力学特性。
+// MINCO 后端优化阶段：对应报告 5.5.4.2 的两步优化策略（PRE 迭代少、FINELY 迭代多）。
+// 障碍罚在两阶段完全同形——都直接采样连续代价场的解析双线性梯度。
+// 原先 FINELY 阶段的“扣除切向 + 势谷探测”是为了绕开硬膨胀 ESDF 在峡谷中线上
+// 梯度恒为零的缺陷；连续代价场本身处处可微且远处可见，按 HWSentryNav26 的做法不再需要。
 enum class MincoOptimizeStage
 {
   PreOptimization,
@@ -25,8 +26,6 @@ struct MincoOptimizerConfig
   // 动力学软约束上限。
   double max_velocity{1.5};
   double max_acceleration{1.6};
-  // 期望与障碍保持的安全距离（ESDF 距离低于该值开始受罚）。
-  double safe_distance{0.55};
   // 各惩罚项权重。
   double weight_energy{1.0};         // 平滑（jerk 能量）
   double weight_time{32.0};          // 总时间，鼓励更快完成
@@ -37,10 +36,6 @@ struct MincoOptimizerConfig
   double weight_uniform_time{120.0};
   double uniform_time_upper_ratio{1.1};
   double uniform_time_lower_ratio{0.9};
-  // FINELY 阶段的势谷判定阈值（报告取定 0.5）。
-  double valley_gradient_threshold{0.5};
-  // 势谷处理：violaPos 大小 = valley_scale * sqrt(gradPos.norm())（报告 5.5.4.2）。
-  double valley_scale{1.0};
   // 每段轨迹上的约束采样点数（数值积分分辨率，取偶数配合辛普森积分）。
   int samples_per_piece{16};
   // L-BFGS 参数。
@@ -59,8 +54,6 @@ struct MincoOptimizerResult
   int iterations{0};
   double initial_cost{0.0};
   double final_cost{0.0};
-  // FINELY 阶段势谷分支命中的采样点次数（可观测指标，报告 5.5.4.2 梯度无效化处理）。
-  int valley_hits{0};
 };
 
 // 基于 MINCO 控制点（内部路标点）与分段时间的两步无约束优化器。
@@ -81,7 +74,7 @@ public:
   MincoOptimizerResult optimize(
     const std::vector<Point2D> & waypoints, const std::vector<double> & times,
     const MincoBoundaryState & head, const MincoBoundaryState & tail,
-    const EsdfMap & esdf, MincoOptimizeStage stage) const;
+    const Grid2D & cost_map, MincoOptimizeStage stage) const;
 
   const MincoOptimizerConfig & config() const { return config_; }
 

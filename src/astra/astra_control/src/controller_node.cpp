@@ -1,7 +1,9 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include "astra_control/se2_mpc_controller.hpp"
 #include "astra_control/chassis_kinematics.hpp"
 #include "astra_control/high_rate_state_estimator.hpp"
+#include "astra_control/route_tracker.hpp"
 #include "astra_planning/minco_trajectory.hpp"
 
 namespace astra_nav
@@ -29,7 +32,8 @@ public:
   ControllerNode()
   : Node("controller_node"), controller_(make_controller_config()),
     mpc_preview_(make_mpc_preview_config()), mpc_controller_(make_mpc_config()),
-    chassis_(make_chassis_config()), estimator_(make_estimator_config())
+    chassis_(make_chassis_config()), estimator_(make_estimator_config()),
+    route_tracker_(make_route_tracker_params())
   {
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/astra/odom");
     path_topic_ = declare_parameter<std::string>("path_topic", "/astra/trajectory");
@@ -41,13 +45,22 @@ public:
     tracking_error_warn_threshold_ = declare_parameter("tracking_error_warn_threshold", 0.35);
     tracking_velocity_error_warn_threshold_ =
       declare_parameter("tracking_velocity_error_warn_threshold", 0.35);
-    linear_command_accel_limit_ = declare_parameter("linear_command_accel_limit", 1.2);
+    // 命令速率上限须【不低于】规划器的切向加速度上限，否则控制器结构上跟不上轨迹加速段，
+    // 会持续积累纵向滞后。对应上游 capability.command_dynamics.velocity_rate_max(2.0)
+    // ≥ path_planner 的 tangential_acceleration_max(1.5)。
+    linear_command_accel_limit_ = declare_parameter("linear_command_accel_limit", 2.0);
     angular_command_accel_limit_ = declare_parameter("angular_command_accel_limit", 2.0);
     startup_velocity_error_grace_time_ =
       declare_parameter("startup_velocity_error_grace_time", 0.6);
+    // 轨迹终点移动超过该距离视为新的跟随任务，重新计一次启动渐入宽限。
+    // 与 planner_node.replan_goal_change_threshold 同量级。
+    new_task_goal_distance_ = declare_parameter("new_task_goal_distance", 0.5);
     mpc_preview_enabled_ = declare_parameter("mpc_preview_enabled", true);
     mpc_preview_error_warn_threshold_ =
       declare_parameter("mpc_preview_error_warn_threshold", 0.35);
+    // 进度跟踪来源：true=(s, ṡ) 多假设 RouteTracker（对齐 HWSentryNav26）；
+    // false=旧的"墙钟经过时间"直接当轨迹时间参数。
+    route_tracking_enabled_ = declare_parameter("route_tracking_enabled", true);
 
     // —— 高频积分定位估计（报告 5.5.5.4.1）——
     // 默认关闭，保持“直接用原始里程计位姿”的现有行为；开启后用 IMU 航向角速度
@@ -129,21 +142,44 @@ private:
   PreviewControllerConfig make_controller_config()
   {
     PreviewControllerConfig config;
-    config.lookahead_time = declare_parameter("lookahead_time", 0.18);
-    config.max_linear_velocity = declare_parameter("max_linear_velocity", 1.8);
+    config.max_linear_velocity = declare_parameter("max_linear_velocity", 1.5);
     config.max_angular_velocity = declare_parameter("max_angular_velocity", 2.5);
-    config.position_kp = declare_parameter("position_kp", 1.4);
+    config.contour_kp = declare_parameter("contour_kp", 1.4);
+    config.lag_kp = declare_parameter("lag_kp", 1.4);
     config.heading_kp = declare_parameter("heading_kp", 2.2);
     config.velocity_damping = declare_parameter("velocity_damping", 0.6);
     config.arrival_position_tolerance = declare_parameter("arrival_position_tolerance", 0.18);
-    config.arrival_reference_speed_tolerance =
-      declare_parameter("arrival_reference_speed_tolerance", 0.05);
+    config.arrival_remaining_distance_tolerance =
+      declare_parameter("arrival_remaining_distance_tolerance", 0.18);
     config.path_heading_tracking_enabled = declare_parameter("path_heading_tracking_enabled", false);
     config.heading_startup_ramp_time = declare_parameter("heading_startup_ramp_time", 0.8);
     config.heading_error_deadband = declare_parameter("heading_error_deadband", 0.03);
     config.heading_control_min_reference_speed =
       declare_parameter("heading_control_min_reference_speed", 0.05);
     return config;
+  }
+
+  // (s, ṡ) 有向进度观测器参数（默认值取自 HWSentryNav26 task_manager.yaml route_tracker 段）。
+  RouteTrackerParams make_route_tracker_params()
+  {
+    RouteTrackerParams params;
+    params.initial_search_distance =
+      declare_parameter("route_tracker.initial_search_distance", 0.5);
+    params.max_tracking_error = declare_parameter("route_tracker.max_tracking_error", 2.0);
+    params.prediction_time_limit = declare_parameter("route_tracker.prediction_time_limit", 0.2);
+    params.hypothesis_spacing = declare_parameter("route_tracker.hypothesis_spacing", 0.05);
+    params.max_hypotheses = declare_parameter("route_tracker.max_hypotheses", 6);
+    params.hypothesis_prune_ratio = declare_parameter("route_tracker.hypothesis_prune_ratio", 3.0);
+    params.position_sigma = declare_parameter("route_tracker.position_sigma", 0.20);
+    params.velocity_sigma = declare_parameter("route_tracker.velocity_sigma", 0.30);
+    params.progress_sigma = declare_parameter("route_tracker.progress_sigma", 0.15);
+    params.profile_speed_sigma = declare_parameter("route_tracker.profile_speed_sigma", 0.80);
+    params.speed_dynamics_sigma = declare_parameter("route_tracker.speed_dynamics_sigma", 0.30);
+    // 上游取所有跟随能力档中的最大线速度上限；这里对应取两种控制器的线速度上限较大者。
+    params.max_path_speed = std::max(
+      get_parameter("max_linear_velocity").as_double(),
+      get_parameter("mpc_max_velocity").as_double());
+    return params;
   }
 
   Se2MpcPreviewConfig make_mpc_preview_config()
@@ -279,8 +315,25 @@ private:
     if (!used_path_timing) {
       trajectory_ = refit_trajectory_from_path(path);
     }
+    // 启动渐入锚点按【跟随任务】而非【单条轨迹】重置：同一目标的 5 Hz 重规划不重置，
+    // 否则渐入判定全程为真，把真正的速度超限 WARN 降级成 INFO 掩盖掉；目标点变化
+    // （或从无轨迹恢复）才算新任务，重新给一次渐入宽限。
+    const bool new_follow_task = !has_trajectory_ || trajectory_.empty() ||
+      !has_task_goal_ ||
+      std::hypot(trajectory_.back().x - task_goal_.x, trajectory_.back().y - task_goal_.y) >
+      new_task_goal_distance_;
+    if (new_follow_task && !trajectory_.empty()) {
+      startup_anchor_time_ = now();
+    }
+    if (!trajectory_.empty()) {
+      task_goal_ = {trajectory_.back().x, trajectory_.back().y};
+      has_task_goal_ = true;
+    }
     trajectory_start_time_ = now();
     has_trajectory_ = !trajectory_.empty();
+    // 轨迹版本号自增 = 上游 `path != path_` 的路径身份变化，令 RouteTracker 清空假设集
+    // 与进度下界，在新轨迹起点附近重新建立初始进度。
+    ++trajectory_revision_;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "控制器已接收新轨迹，采样点数量：%zu，时间来源：%s。",
@@ -329,7 +382,10 @@ private:
     for (const auto & pose : path.poses) {
       points.push_back({pose.pose.position.x, pose.pose.position.y});
     }
-    const auto times = cumulative_times(points, 1.5, 1.6);
+    // 无时间戳路径的兜底重拟合：动力学上限取控制器自身的上限（与规划器同源），
+    // 不再写死 1.5/1.6，否则调整速度上限时这条兜底路径会悄悄留在旧值上。
+    const auto times = cumulative_times(
+      points, controller_.config().max_linear_velocity, linear_command_accel_limit_);
     return MincoTrajectory::fit(points, times).sample(0.02);
   }
 
@@ -378,7 +434,9 @@ private:
       return;
     }
 
-    const double elapsed = std::max(0.0, (now() - trajectory_start_time_).seconds());
+    const double wall_elapsed = std::max(0.0, (now() - trajectory_start_time_).seconds());
+    // 渐入判定用整段任务的经过时间，与单条轨迹的墙钟时间区分开。
+    const double startup_elapsed = std::max(0.0, (now() - startup_anchor_time_).seconds());
 
     // —— 高频积分定位估计（报告 5.5.5.4.1）——
     // 开启时：以有延迟的里程计为锚点，借 IMU 航向角速度+底盘体速度积分到当前控制时刻，
@@ -391,6 +449,34 @@ private:
       world_velocity = est.world_velocity;
       log_estimation(est);
     }
+
+    // —— (s, ṡ) 有向进度观测（对齐 HWSentryNav26 RouteTracker）——
+    // 旧行为直接把"轨迹发布以来的墙钟时间"当作轨迹时间参数去取参考点：一旦机器人被挡、
+    // 打滑、启动迟滞或重规划迟到，参考点会独立于机器人真实进度往前跑，参考误差越拉越大。
+    // 现在进度是位置+地图系速度矢量共同观测出的时序状态，并保持单调不减，参考点索引改用
+    // 进度弧长换算出的轨迹时间参数。
+    double elapsed = wall_elapsed;
+    // 预瞄控制器的参考点严格取自弧长进度 s（上游 follow_problem::reference_frame），
+    // 不做任何时间前瞻；进度观测不可用时传 nullptr 让控制器按时间自建参考点兜底。
+    std::optional<RouteReferenceFrame> reference_frame;
+    if (route_tracking_enabled_) {
+      route_estimate_ = route_tracker_.update(
+        trajectory_, trajectory_revision_, control_pose, world_velocity, now().seconds());
+      if (route_estimate_) {
+        elapsed = route_estimate_->reference_time;
+        RouteReferenceFrame frame;
+        frame.position = route_estimate_->reference_position;
+        frame.tangent_yaw = route_estimate_->tangent_yaw;
+        frame.profile_speed = route_estimate_->profile_speed;
+        frame.arc_length = route_estimate_->arc_length;
+        frame.remaining_length = route_estimate_->remaining_length;
+        frame.reference_time = route_estimate_->reference_time;
+        reference_frame = frame;
+      }
+      log_route_tracking(wall_elapsed);
+    }
+    const RouteReferenceFrame * const reference_ptr =
+      reference_frame ? &*reference_frame : nullptr;
 
     // 计算期望速度命令。两种控制器：
     //   preview：预瞄原型，吃世界系位姿与轨迹；
@@ -406,14 +492,16 @@ private:
         mpc_used = true;
       } else {
         // QP 求解失败：回退到预瞄控制器（同样传入真实世界速度用于速度阻尼刹车）。
-        desired_twist = controller_.compute(control_pose, world_velocity, trajectory_, elapsed);
+        desired_twist = controller_.compute(
+          control_pose, world_velocity, trajectory_, elapsed, reference_ptr);
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "MPC 求解失败，本周期回退到预瞄控制器输出。");
       }
       log_mpc_solver(mpc_controller_.last_debug());
     } else {
-      desired_twist = controller_.compute(control_pose, world_velocity, trajectory_, elapsed);
+      desired_twist = controller_.compute(
+        control_pose, world_velocity, trajectory_, elapsed, reference_ptr);
     }
 
     const auto current_time = now();
@@ -432,7 +520,8 @@ private:
     // 预瞄控制器的跟踪指标依赖其内部 debug，仅在 preview 模式下输出。
     if (!mpc_used) {
       log_tracking_metrics(
-        elapsed, desired_twist, twist, command_linear_delta, command_angular_delta);
+        elapsed, startup_elapsed, desired_twist, twist, command_linear_delta,
+        command_angular_delta);
     }
     if (mpc_preview_enabled_ && !use_mpc_) {
       const auto preview = mpc_preview_.predict(control_pose, twist, trajectory_, elapsed);
@@ -470,8 +559,11 @@ private:
     return limited;
   }
 
+  // elapsed：参考点索引用的轨迹时间参数（开进度观测时来自弧长换算，否则等于墙钟时间）。
+  // startup_elapsed：整段跟随任务开始至今的时间，仅用于启动渐入判定。
   void log_tracking_metrics(
-    double elapsed, const Twist2D & desired_command, const Twist2D & output_command,
+    double elapsed, double startup_elapsed, const Twist2D & desired_command,
+    const Twist2D & output_command,
     double command_linear_delta, double command_angular_delta)
   {
     const auto & debug = controller_.last_debug();
@@ -487,41 +579,42 @@ private:
     const double desired_angular_speed = std::abs(desired_command.wz);
     const double output_linear_speed = std::hypot(output_command.vx, output_command.vy);
     const double output_angular_speed = std::abs(output_command.wz);
-    const double velocity_error = std::abs(debug.nearest_reference_speed - odom_linear_speed);
+    // 速度误差取【切向投影速度相对参考速度的超出量】，与控制律的阻尼项同一判据。
+    const double velocity_error = std::max(0.0, debug.projected_speed - debug.reference_speed);
     const char * phase = elapsed <= duration ? "跟踪中" : "末端保持";
     if (debug.stopped_by_arrival_tolerance) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), tracking_log_period_ms_,
-        "控制器进入近距离保持：阶段=%s，轨迹时刻=%.3f s，最近误差=%.3f m，前瞻误差=%.3f m，参考线速度=%.3f m/s，实际线速度=%.3f m/s，输出零速度，剩余时间=%.3f s。",
-        phase, debug.current_time, debug.nearest_position_error, debug.target_position_error,
-        debug.nearest_reference_speed, odom_linear_speed, remaining_time);
+        "控制器进入近距离保持：阶段=%s，轨迹时刻=%.3f s，参考误差=%.3f m，终点距离=%.3f m，剩余弧长=%.3f m，参考线速度=%.3f m/s，实际线速度=%.3f m/s，输出零速度，剩余时间=%.3f s。",
+        phase, debug.current_time, debug.position_error, debug.goal_distance,
+        debug.remaining_length, debug.reference_speed, odom_linear_speed, remaining_time);
       return;
     }
     const double command_linear_gap =
       std::hypot(desired_command.vx - output_command.vx, desired_command.vy - output_command.vy);
     const double command_angular_gap = std::abs(desired_command.wz - output_command.wz);
     const bool startup_ramp_active =
-      elapsed <= startup_velocity_error_grace_time_ &&
+      startup_elapsed <= startup_velocity_error_grace_time_ &&
       (command_linear_gap > 0.03 || command_angular_gap > 0.03);
     if (startup_ramp_active && velocity_error > tracking_velocity_error_warn_threshold_) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), tracking_log_period_ms_,
-        "控制器启动渐入：阶段=%s，轨迹时刻=%.3f s，最近参考时刻=%.3f s，最近误差=%.3f m，前瞻误差=%.3f m，参考线速度=%.3f m/s，实际线速度=%.3f m/s，速度误差=%.3f m/s，期望指令=(%.3f m/s, %.3f rad/s)，输出指令=(%.3f m/s, %.3f rad/s)，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
-        phase, debug.current_time, debug.nearest_reference_time, debug.nearest_position_error,
-        debug.target_position_error, debug.nearest_reference_speed, odom_linear_speed,
+        "控制器启动渐入：阶段=%s，轨迹时刻=%.3f s，参考弧长=%.3f m，参考误差=%.3f m，横向误差=%.3f m，纵向误差=%.3f m，参考线速度=%.3f m/s，切向投影速度=%.3f m/s，超速量=%.3f m/s，期望指令=(%.3f m/s, %.3f rad/s)，输出指令=(%.3f m/s, %.3f rad/s)，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
+        phase, debug.current_time, debug.reference_arc_length, debug.position_error,
+        debug.contour_error, debug.lag_error, debug.reference_speed, debug.projected_speed,
         velocity_error, desired_linear_speed, desired_angular_speed, output_linear_speed,
         output_angular_speed, command_linear_delta, command_angular_delta, remaining_time);
       return;
     }
-    if (debug.nearest_position_error > tracking_error_warn_threshold_ ||
+    if (debug.position_error > tracking_error_warn_threshold_ ||
       velocity_error > tracking_velocity_error_warn_threshold_)
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), tracking_log_period_ms_,
-        "控制跟踪误差偏大：阶段=%s，轨迹时刻=%.3f s，最近参考时刻=%.3f s，最近误差=%.3f m，前瞻误差=%.3f m，参考线速度=%.3f m/s，实际线速度=%.3f m/s，速度误差=%.3f m/s，生效航向误差=%.3f rad，原始航向误差=%.3f rad，航向权重=%.2f，指令线速度=%.3f m/s，指令角速度=%.3f rad/s，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
-        phase, debug.current_time, debug.nearest_reference_time, debug.nearest_position_error,
-        debug.target_position_error, debug.nearest_reference_speed, odom_linear_speed,
-        velocity_error, debug.target_heading_error, debug.raw_target_heading_error,
+        "控制跟踪误差偏大：阶段=%s，轨迹时刻=%.3f s，参考弧长=%.3f m，参考误差=%.3f m，横向误差=%.3f m，纵向误差=%.3f m，参考线速度=%.3f m/s，切向投影速度=%.3f m/s，实际线速度=%.3f m/s，超速量=%.3f m/s，生效航向误差=%.3f rad，原始航向误差=%.3f rad，航向权重=%.2f，指令线速度=%.3f m/s，指令角速度=%.3f rad/s，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
+        phase, debug.current_time, debug.reference_arc_length, debug.position_error,
+        debug.contour_error, debug.lag_error, debug.reference_speed, debug.projected_speed,
+        odom_linear_speed, velocity_error, debug.heading_error, debug.raw_heading_error,
         debug.heading_control_weight, output_linear_speed, output_angular_speed,
         command_linear_delta, command_angular_delta, remaining_time);
       return;
@@ -529,12 +622,39 @@ private:
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), tracking_log_period_ms_,
-      "控制跟踪指标：阶段=%s，轨迹时刻=%.3f s，最近参考时刻=%.3f s，前瞻参考时刻=%.3f s，最近误差=%.3f m，前瞻误差=%.3f m，参考线速度=%.3f m/s，实际线速度=%.3f m/s，速度误差=%.3f m/s，实际角速度=%.3f rad/s，生效航向误差=%.3f rad，原始航向误差=%.3f rad，航向权重=%.2f，指令线速度=%.3f m/s，指令角速度=%.3f rad/s，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
-      phase, debug.current_time, debug.nearest_reference_time, debug.target_reference_time,
-      debug.nearest_position_error, debug.target_position_error, debug.nearest_reference_speed,
-      odom_linear_speed, velocity_error, odom_angular_speed, debug.target_heading_error,
-      debug.raw_target_heading_error, debug.heading_control_weight, output_linear_speed,
-      output_angular_speed, command_linear_delta, command_angular_delta, remaining_time);
+      "控制跟踪指标：阶段=%s，轨迹时刻=%.3f s，参考时刻=%.3f s，参考弧长=%.3f m，剩余弧长=%.3f m，参考误差=%.3f m，横向误差=%.3f m，纵向误差=%.3f m，终点距离=%.3f m，参考线速度=%.3f m/s，切向投影速度=%.3f m/s，实际线速度=%.3f m/s，超速量=%.3f m/s，实际角速度=%.3f rad/s，生效航向误差=%.3f rad，航向权重=%.2f，指令线速度=%.3f m/s，指令角速度=%.3f rad/s，命令变化=(%.3f m/s, %.3f rad/s)，剩余时间=%.3f s。",
+      phase, debug.current_time, debug.reference_time, debug.reference_arc_length,
+      debug.remaining_length, debug.position_error, debug.contour_error, debug.lag_error,
+      debug.goal_distance, debug.reference_speed, debug.projected_speed, odom_linear_speed,
+      velocity_error, odom_angular_speed, debug.heading_error, debug.heading_control_weight,
+      output_linear_speed, output_angular_speed, command_linear_delta, command_angular_delta,
+      remaining_time);
+  }
+
+  void log_route_tracking(double wall_elapsed)
+  {
+    if (!route_estimate_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), tracking_log_period_ms_,
+        "进度观测器无有效估计（轨迹点不足），本周期回退到墙钟时间索引参考点。");
+      return;
+    }
+    const auto & route = *route_estimate_;
+    const char * status =
+      route.status == RouteTrackingStatus::TRACKED ? "跟踪中" : "已丢失";
+    if (route.status == RouteTrackingStatus::LOST) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), tracking_log_period_ms_,
+        "进度观测：状态=%s，弧长=%.3f m，剩余=%.3f m，路径速度=%.3f m/s，参考点偏差=%.3f m（超过 max_tracking_error），参考时刻=%.3f s，墙钟时刻=%.3f s，存活假设=%d。",
+        status, route.arc_length, route.remaining_length, route.path_speed,
+        route.tracking_error, route.reference_time, wall_elapsed, route.hypothesis_count);
+      return;
+    }
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), tracking_log_period_ms_,
+      "进度观测：状态=%s，弧长=%.3f m，剩余=%.3f m，路径速度=%.3f m/s，参考点偏差=%.3f m，参考时刻=%.3f s，墙钟时刻=%.3f s，存活假设=%d。",
+      status, route.arc_length, route.remaining_length, route.path_speed,
+      route.tracking_error, route.reference_time, wall_elapsed, route.hypothesis_count);
   }
 
   void log_mpc_preview(const Se2MpcPreviewResult & preview, bool near_hold_active)
@@ -640,6 +760,9 @@ private:
   std::vector<std::string> chassis_wheel_joint_names_;
   bool has_odom_{false};
   bool has_trajectory_{false};
+  bool route_tracking_enabled_{true};
+  std::uint64_t trajectory_revision_{0};
+  std::optional<RouteEstimate> route_estimate_;
   Pose2D pose_;
   Twist2D odom_twist_;
   Twist2D last_cmd_;
@@ -647,12 +770,20 @@ private:
   rclcpp::Time last_control_time_;
   bool has_last_control_time_{false};
   rclcpp::Time trajectory_start_time_;
+  // 启动渐入判定的锚点：整段跟随任务的起点，同一目标的重规划不刷新。
+  rclcpp::Time startup_anchor_time_;
+  Point2D task_goal_{};
+  bool has_task_goal_{false};
+  double new_task_goal_distance_{0.5};
   std::vector<TrajectoryPoint> trajectory_;
   PreviewController controller_;
   Se2MpcPreview mpc_preview_;
   Se2MpcController mpc_controller_;
   ChassisKinematics chassis_;
   HighRateStateEstimator estimator_;
+  // 声明必须在 estimator_ 之后：其参数构造依赖 make_controller_config/make_mpc_config
+  // 已声明的 max_linear_velocity / mpc_max_velocity（成员按声明顺序初始化）。
+  RouteTracker route_tracker_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

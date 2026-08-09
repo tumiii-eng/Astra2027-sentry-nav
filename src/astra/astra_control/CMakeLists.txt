@@ -29,6 +29,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(astra_control
+  src/route_tracker.cpp
   src/preview_controller.cpp
   src/se2_mpc_preview.cpp
   src/se2_mpc_controller.cpp

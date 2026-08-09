@@ -20,29 +20,56 @@ void test_controller()
   const auto times = astra_nav::cumulative_times(points, 1.0, 1.0);
   const auto trajectory = astra_nav::MincoTrajectory::fit(points, times).sample(0.05);
   astra_nav::PreviewController controller({});
+  // 机器人正好在起点：参考点取 s=0 处，无时间前瞻，故位置误差应为零，命令纯前馈。
   const auto cmd = controller.compute({0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, trajectory, 0.0);
   const auto & debug = controller.last_debug();
   assert(cmd.vx > 0.0);
   assert(std::abs(cmd.vy) < 1e-6);
   assert(debug.valid);
-  assert(debug.target_position_error > 0.0);
-  assert(debug.nearest_reference_speed > 0.0);
-  assert(debug.target_reference_speed > 0.0);
+  assert(debug.position_error < 1e-6);
+  assert(std::abs(debug.contour_error) < 1e-6);
+  assert(std::abs(debug.lag_error) < 1e-6);
+  assert(debug.reference_speed > 0.0);
+  assert(debug.remaining_length > 1.9);
   assert(debug.command_linear_speed > 0.0);
-  assert(std::abs(debug.raw_target_heading_error) < 1e-6);
-  assert(std::abs(debug.target_heading_error) < 1e-6);
+  // 无位置误差、无超速时命令应等于参考速度（纯前馈）。
+  assert(std::abs(debug.command_linear_speed - debug.reference_speed) < 1e-6);
+  assert(std::abs(debug.raw_heading_error) < 1e-6);
+  assert(std::abs(debug.heading_error) < 1e-6);
   assert(debug.heading_control_weight < 1e-6);
 
+  // 参考点严格取当前时刻处，不做时间前瞻：沿 +x 匀速的显式轨迹，t=1.0 的参考点必在 (1.0, 0)。
+  const std::vector<astra_nav::TrajectoryPoint> straight_trajectory{
+    {0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
+    {1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
+    {2.0, 2.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0}};
+  // 机器人落后参考点 0.3 m：误差应全落在纵向(lag)上，横向(contour)为零。
+  astra_nav::PreviewController lag_controller({});
+  lag_controller.compute({0.7, 0.0, 0.0}, {1.0, 0.0, 0.0}, straight_trajectory, 1.0);
+  const auto & lag_debug = lag_controller.last_debug();
+  assert(std::abs(lag_debug.lag_error - 0.3) < 1e-6);
+  assert(std::abs(lag_debug.contour_error) < 1e-6);
+  // 旧实现取"当前时刻+前瞻"的参考点，此处会额外多算 lookahead_time*1.0 的虚假纵向误差。
+  assert(lag_debug.position_error < 0.31);
+
+  // 横向偏离时误差应全落在 contour 上。
+  astra_nav::PreviewController contour_controller({});
+  contour_controller.compute({1.0, 0.3, 0.0}, {1.0, 0.0, 0.0}, straight_trajectory, 1.0);
+  const auto & contour_debug = contour_controller.last_debug();
+  assert(std::abs(contour_debug.contour_error + 0.3) < 1e-6);  // 参考点在机器人右侧
+  assert(std::abs(contour_debug.lag_error) < 1e-6);
+
+  // 沿世界 +y 匀速前进：几何切线 = π/2，与机器人 yaw=0 的航向差 ≈1.571 rad。
   const std::vector<astra_nav::TrajectoryPoint> diagonal_trajectory{
-    {0.0, 0.0, 0.0, 1.2, 0.30, 0.0, 0.0, 0.0},
-    {0.2, 0.2, 0.0, 1.2, 0.30, 0.0, 0.0, 0.0},
-    {0.4, 0.4, 0.0, 1.2, 0.30, 0.0, 0.0, 0.0}};
+    {0.0, 0.0, 0.0, 0.0, 0.0, 0.30, 0.0, 0.0},
+    {0.2, 0.0, 0.2, 0.0, 0.0, 0.30, 0.0, 0.0},
+    {0.4, 0.0, 0.4, 0.0, 0.0, 0.30, 0.0, 0.0}};
   astra_nav::PreviewController omni_controller({});
   const auto omni_cmd = omni_controller.compute(
     {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, diagonal_trajectory, 0.2);
   const auto & omni_debug = omni_controller.last_debug();
-  assert(std::abs(omni_debug.raw_target_heading_error) > 1.0);
-  assert(std::abs(omni_debug.target_heading_error) < 1e-9);
+  assert(std::abs(omni_debug.raw_heading_error) > 1.0);
+  assert(std::abs(omni_debug.heading_error) < 1e-9);
   assert(std::abs(omni_cmd.wz) < 1e-9);
 
   astra_nav::PreviewControllerConfig heading_config;
@@ -54,16 +81,18 @@ void test_controller()
     {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, diagonal_trajectory, 0.2);
   const auto & heading_debug = heading_controller.last_debug();
   assert(heading_debug.heading_control_weight > 0.99);
-  assert(std::abs(heading_debug.target_heading_error) > 1.0);
+  assert(std::abs(heading_debug.heading_error) > 1.0);
   assert(heading_cmd.wz > 0.0);
 
+  // 到达保持双判据：终点距离与剩余弧长须同时满足。
   astra_nav::PreviewControllerConfig hold_config;
   hold_config.arrival_position_tolerance = 0.2;
-  hold_config.arrival_reference_speed_tolerance = 0.05;
+  hold_config.arrival_remaining_distance_tolerance = 0.2;
   astra_nav::PreviewController hold_controller(hold_config);
+  // 轨迹三点几乎重合于原点附近，机器人在 (0,0)：终点距离与剩余弧长均在容差内。
   const std::vector<astra_nav::TrajectoryPoint> hold_trajectory{
-    {0.0, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    {0.25, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {0.25, 0.13, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
     {0.50, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
   const auto hold_cmd = hold_controller.compute(
     {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, hold_trajectory, 0.0);
@@ -72,30 +101,73 @@ void test_controller()
   assert(std::abs(hold_cmd.wz) < 1e-9);
   assert(hold_debug.stopped_by_arrival_tolerance);
 
+  // 对照：终点距离在容差内但剩余弧长很长（长轨迹刚起步、终点恰好在附近绕回来），
+  // 单判据会误判为到达并停车，双判据必须继续跟踪。
+  astra_nav::PreviewController not_arrived_controller(hold_config);
+  const std::vector<astra_nav::TrajectoryPoint> loop_trajectory{
+    {0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
+    {1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0},
+    {2.0, 1.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0},
+    {3.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+  const auto loop_cmd = not_arrived_controller.compute(
+    {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, loop_trajectory, 0.0);
+  const auto & loop_debug = not_arrived_controller.last_debug();
+  assert(loop_debug.goal_distance < hold_config.arrival_position_tolerance);
+  assert(loop_debug.remaining_length > 1.0);
+  assert(!loop_debug.stopped_by_arrival_tolerance);
+  assert(std::hypot(loop_cmd.vx, loop_cmd.vy) > 1e-6);
+
   // —— 终点主动刹车（停不稳根因修复）——
-  // 参考轨迹终点静止(v_ref=0)，机器人尚未进容差但正以高速冲向终点：
-  // 有真实速度反馈时，速度阻尼项 -kd*v_actual 应压制甚至反转位置比例项，产生刹车（命令显著低于
-  // 纯位置比例 kp*e_p），从而消除冲过终点的过冲。无真实速度反馈的旧实现只会 kp*e_p 继续加速。
+  // 参考点速度剖面为零(v_ref=0)，机器人尚未进容差但正以高速冲向终点：
+  // 速度阻尼项 -kd*(v_proj - v_ref) 应压低位置回正项，产生刹车（命令显著低于纯 lag 回正项）。
   astra_nav::PreviewControllerConfig brake_config;
-  brake_config.position_kp = 1.4;
+  brake_config.contour_kp = 1.4;
+  brake_config.lag_kp = 1.4;
   brake_config.velocity_damping = 0.6;
   brake_config.arrival_position_tolerance = 0.18;
-  brake_config.arrival_reference_speed_tolerance = 0.05;
+  brake_config.arrival_remaining_distance_tolerance = 0.18;
   const std::vector<astra_nav::TrajectoryPoint> brake_trajectory{
     {0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
     {0.5, 0.85, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
     {1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};  // 终点(1.0,0)静止
-  // 机器人在 (0.7,0)，距终点 0.3m(>容差)，正以 1.5m/s 冲向 +x。
+  // 机器人在 (0.7,0)，参考点取 t=1.0 处即终点(1.0,0)，纵向落后 0.3 m，正以 1.5m/s 冲向 +x。
   astra_nav::PreviewController brake_controller(brake_config);
   const auto brake_cmd =
     brake_controller.compute({0.7, 0.0, 0.0}, {1.5, 0.0, 0.0}, brake_trajectory, 1.0);
-  const double kp_only = brake_config.position_kp * 0.3;  // 纯位置比例项 = 0.42 m/s
-  assert(brake_cmd.vx < kp_only);  // 刹车：命令被真实速度阻尼显著拉低
-  // 对照：同一场景真实速度为零时不应刹车，命令回到纯位置比例项量级。
+  const double lag_only = brake_config.lag_kp * 0.3;  // 纯纵向回正项 = 0.42 m/s
+  assert(brake_cmd.vx < lag_only);  // 刹车：命令被真实速度阻尼显著拉低
+  // 对照：同一场景真实速度为零时不应刹车，命令回到纯纵向回正项量级。
   astra_nav::PreviewController brake_ctrl_zero(brake_config);
   const auto no_brake_cmd =
     brake_ctrl_zero.compute({0.7, 0.0, 0.0}, {0.0, 0.0, 0.0}, brake_trajectory, 1.0);
+  assert(std::abs(no_brake_cmd.vx - lag_only) < 1e-6);  // 无超速时 = 纯 lag 回正
   assert(no_brake_cmd.vx > brake_cmd.vx + 0.5);  // 有速度时明显更小（差约 kd*1.5=0.9）
+
+  // 阻尼是单侧的：真实速度【低于】参考速度时不得反向助推加速（上游只惩罚超速侧）。
+  const std::vector<astra_nav::TrajectoryPoint> cruise_trajectory{
+    {0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0},
+    {1.0, 1.5, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0},
+    {2.0, 3.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0}};
+  astra_nav::PreviewController slow_controller(brake_config);
+  // 机器人正好在参考点上但只跑到 0.5 m/s：命令应等于参考速度 1.5，不因阻尼被改动。
+  const auto slow_cmd =
+    slow_controller.compute({1.5, 0.0, 0.0}, {0.5, 0.0, 0.0}, cruise_trajectory, 1.0);
+  assert(std::abs(slow_cmd.vx - 1.5) < 1e-6);
+  // 超速侧：同一位置以 2.2 m/s 跑，命令应被压到参考速度以下。
+  astra_nav::PreviewController fast_controller(brake_config);
+  const auto fast_cmd =
+    fast_controller.compute({1.5, 0.0, 0.0}, {2.2, 0.0, 0.0}, cruise_trajectory, 1.0);
+  assert(fast_cmd.vx < 1.5);
+  assert(std::abs(fast_cmd.vx - (1.5 - 0.6 * 0.7)) < 1e-6);
+
+  // 线速度上限硬约束：无论回正项多大，输出不得超过 max_linear_velocity。
+  astra_nav::PreviewControllerConfig cap_config = brake_config;
+  cap_config.max_linear_velocity = 1.5;
+  astra_nav::PreviewController cap_controller(cap_config);
+  // 机器人大幅落后参考点（纵向误差 2.0 m），回正项 1.4*2.0=2.8 远超上限。
+  const auto cap_cmd =
+    cap_controller.compute({-0.5, 0.0, 0.0}, {0.0, 0.0, 0.0}, cruise_trajectory, 1.0);
+  assert(std::hypot(cap_cmd.vx, cap_cmd.vy) <= cap_config.max_linear_velocity + 1e-9);
 
   astra_nav::Se2MpcPreviewConfig preview_config;
   preview_config.steps = 8;

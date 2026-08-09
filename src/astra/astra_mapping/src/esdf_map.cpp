@@ -24,8 +24,9 @@ EsdfMap::EsdfMap(const Grid2D & obstacles)
   std::vector<std::uint8_t> occupied(cell_count, 0);
   std::vector<std::uint8_t> free_mask(cell_count, 0);
   std::size_t occupied_count = 0;
+  // 0-255 连续代价场：只有达到硬占用阈值的格才是障碍源，膨胀衰减区仍属自由空间。
   for (std::size_t i = 0; i < cell_count; ++i) {
-    if (obstacles.data[i] != 0) {
+    if (obstacles.data[i] >= kOccupiedCostThreshold) {
       occupied[i] = 1;
       ++occupied_count;
     } else {

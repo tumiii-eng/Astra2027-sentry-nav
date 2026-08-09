@@ -12,28 +12,43 @@ global_obstacle_map_node:
     use_sim_time: true
     map_topic: /red_standard_robot1/map          # 先验静态地图(含手动标注)，map 帧
     terrain_topic: /red_standard_robot1/terrain_map  # 实时动态障碍，odom 帧
-    output_topic: /astra/global_obstacle_grid
+    output_topic: /astra/global_obstacle_grid         # 静态层(障碍源二值图)
+    dynamic_output_topic: /astra/dynamic_obstacle_grid  # 动态层(障碍源二值图)
     input_odom_topic: /red_standard_robot1/odometry  # pb2025 odom 帧里程计
     output_odom_topic: /astra/odom                   # 重投影到 map 帧
     map_frame: map
-    inflation_radius: 0.0        # 膨胀全部交给 planner 统一做一次(避免双重膨胀切断连通域,见BUG-1)
-    dynamic_intensity_min: 0.1   # terrain_map intensity(离地高)>此值算障碍(对齐 nav2)
+    inflation_radius: 0.0        # 膨胀全部交给 planner 统一做(避免双重膨胀切断连通域,见BUG-1)
+    # 动态障碍多级过滤（对齐 HWSentryNav26 map_server local_map.*）。
+    dynamic_intensity_min: 0.1   # terrain_map intensity(离地高)下界(对齐 nav2 min_obstacle_intensity)
+    dynamic_intensity_max: 2.0   # 上界：治 BUG-5 飞车,高处点(天花板/穹顶)不能算平面障碍
     dynamic_decay_sec: 1.5       # 动态障碍保留时间
     enable_dynamic: true         # 阶段2:叠加动态障碍;阶段1可临时设 false 只用静态
+    bypass_dynamic_obstacle: false  # 置 true 则动态层恒发空图,用于隔离调试
+    sor_num_neighbors: 12        # SOR 统计离群点过滤 K 近邻数
+    sor_std_mul: 2.0             # SOR 保留阈值=均值+此倍数*标准差
+    min_projected_point_density_per_m2: 800.0  # 投影密度门限(点/m²),按分辨率换算为每格最小点数
+    min_obstacle_cluster_area_m2: 0.0075       # 连通域最小物理面积(m²),滤除噪声散点
     publish_rate_hz: 5.0
 
 planner_node:
   ros__parameters:
     use_sim_time: true
     odom_topic: /astra/odom                       # map 帧(全局图节点重投影)
-    obstacle_grid_topic: /astra/global_obstacle_grid  # 全场全局障碍图
+    obstacle_grid_topic: /astra/global_obstacle_grid   # 静态层障碍源
+    dynamic_grid_topic: /astra/dynamic_obstacle_grid   # 动态层障碍源(两层各自膨胀后 max 合并)
     goal_topic: /red_standard_robot1/goal_pose    # RViz 2D Goal Pose 工具
     path_topic: /astra/trajectory
     map_frame: map
-    # BUG-1 治标：膨胀降到≈机器人半径,单次膨胀(global节点已设0),避免双重膨胀切断窄走廊连通域。
-    robot_radius: 0.25
-    safety_margin: 0.0
-    # BUG-4:把 planner 内部 JPS 真正搜索用的膨胀图发布出来,做到膨胀所见即所得。
+    # 连续代价场膨胀：静态层用 global 参数,动态层用 dynamic 参数,各膨胀一次后逐格取 max。
+    # 机器人是质点,full_cost_radius_m 承担硬安全边界(需覆盖车体半径≈0.25),
+    # cutoff_radius_m 内是只加权不阻断的软代价,故不会像旧的硬膨胀那样切断窄走廊(BUG-1)。
+    inflation.full_cost_radius_m: 0.25
+    inflation.cutoff_radius_m: 0.55
+    inflation.decay_rate_per_m: 24.0
+    dynamic_inflation.full_cost_radius_m: 0.3
+    dynamic_inflation.cutoff_radius_m: 0.6
+    dynamic_inflation.decay_rate_per_m: 16.0
+    # BUG-4:把 planner 内部前端真正搜索用的代价图发布出来,做到膨胀所见即所得。
     publish_inflated_grid: true
     inflated_grid_topic: /astra/planner_inflated_grid
     # MINCO 两步优化迭代上限=计算预算(5Hz→200ms周期内,实测耗时~20-48ms)。长轨迹按报告 5.5.4.1
@@ -52,3 +67,7 @@ controller_node:
     cmd_vel_topic: /cmd_vel             # 由 launch remap -> /<ns>/cmd_vel_nav2_result
     state_estimation_enabled: false
     controller_type: preview
+    # (s, ṡ) 有向进度观测器（对齐 HWSentryNav26 route_tracker）。参考点索引由观测出的
+    # 弧长进度换算，取代"轨迹发布以来的墙钟时间"，机器人被挡/打滑/启动迟滞时参考点
+    # 不会独立于真实进度往前跑。默认值见 astra_bringup/config/astra_nav.yaml。
+    route_tracking_enabled: true

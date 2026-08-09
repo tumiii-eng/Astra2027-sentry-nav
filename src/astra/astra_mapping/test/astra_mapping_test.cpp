@@ -54,10 +54,10 @@ void test_esdf_quadratic_interpolation()
   // 世界坐标 y = origin.y + (30+0.5)*res = -3.0 + 3.05 = 0.05。
   for (int x = 0; x < grid.width; ++x) {
     for (int y = 27; y <= 28; ++y) {
-      grid.at(x, y) = 1;
+      grid.at(x, y) = 255;
     }
     for (int y = 32; y <= 33; ++y) {
-      grid.at(x, y) = 1;
+      grid.at(x, y) = 255;
     }
   }
   astra_nav::EsdfMap esdf(grid);
@@ -67,7 +67,8 @@ void test_esdf_quadratic_interpolation()
     double best = 1.0e9;
     for (int x = 0; x < grid.width; ++x) {
       for (int y = 0; y < grid.height; ++y) {
-        if (grid.at(x, y) == 0) {
+        // EsdfMap 以 kOccupiedCostThreshold 作为硬占用判据，暴力对照必须用同一判据。
+        if (grid.at(x, y) < astra_nav::kOccupiedCostThreshold) {
           continue;
         }
         const auto w = esdf.grid_to_world(x, y);

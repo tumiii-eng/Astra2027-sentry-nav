@@ -96,52 +96,103 @@ std::vector<Point2D> resample_polyline(const std::vector<Point2D> & points, doub
   return output;
 }
 
-std::vector<double> cumulative_times(
-  const std::vector<Point2D> & points, double max_velocity, double max_acceleration)
+namespace
+{
+
+// 前向-后向速度² 可达传播 + 梯形时间积分。
+// 逐行对应上游 HWSentryNav26 speed_profile_optimizer.cpp 的 reachable_seed()（第 314-347 行）
+// 与 make_profile()（第 351-370 行）。nodes 为单调不减的累计【等效路程】。
+std::vector<double> integrate_reachable_times(
+  const std::vector<double> & nodes, double max_velocity, double max_acceleration,
+  double start_speed)
 {
   std::vector<double> times;
-  if (points.empty()) {
+  if (nodes.empty()) {
     return times;
   }
-  times.reserve(points.size());
+  times.reserve(nodes.size());
   times.push_back(0.0);
+  if (nodes.size() == 1) {
+    return times;
+  }
 
   const double vmax = std::max(max_velocity, 1e-3);
   const double amax = std::max(max_acceleration, 1e-3);
-  const double t_acc = vmax / amax;
-  const double s_acc = 0.5 * amax * t_acc * t_acc;
+  const double speed_squared_upper = vmax * vmax;
 
-  for (std::size_t i = 1; i < points.size(); ++i) {
-    const double dist = distance_2d(points[i - 1], points[i]);
+  // 起点实测速度允许暂时超出 nominal 包络（上游 limits.front().speed_squared_upper
+  // 与 measured_initial_speed_squared 取 max），随后由终点零速反向裁成可达值。
+  const double start = std::max(0.0, start_speed);
+  std::vector<double> speed_squared(nodes.size(), 0.0);
+  speed_squared[0] = start * start;
+
+  // 前向：加速可达性 z[i+1] = min(z_upper, z[i] + 2·a·Δs)。
+  for (std::size_t i = 0; i + 1 < nodes.size(); ++i) {
+    const double ds = std::max(0.0, nodes[i + 1] - nodes[i]);
+    speed_squared[i + 1] = std::min(speed_squared_upper, speed_squared[i] + 2.0 * amax * ds);
+  }
+  // 终点停稳。
+  speed_squared.back() = 0.0;
+  // 后向：刹车可达性 z[i] = min(z[i], z[i+1] + 2·a·Δs)。
+  for (std::size_t reverse = nodes.size() - 1; reverse > 0; --reverse) {
+    const std::size_t i = reverse - 1;
+    const double ds = std::max(0.0, nodes[i + 1] - nodes[i]);
+    speed_squared[i] = std::min(speed_squared[i], speed_squared[i + 1] + 2.0 * amax * ds);
+  }
+
+  // 时间：匀加速段 Δt = 2Δs / (v_i + v_{i+1})。
+  for (std::size_t i = 0; i + 1 < nodes.size(); ++i) {
+    const double ds = std::max(0.0, nodes[i + 1] - nodes[i]);
+    const double v = std::sqrt(std::max(speed_squared[i], 0.0));
+    const double v_next = std::sqrt(std::max(speed_squared[i + 1], 0.0));
+    const double velocity_sum = v + v_next;
     double dt = 0.0;
-    if (dist >= 2.0 * s_acc) {
-      dt = 2.0 * t_acc + (dist - 2.0 * s_acc) / vmax;
+    if (velocity_sum > 1e-6) {
+      dt = 2.0 * ds / velocity_sum;
     } else {
-      dt = 2.0 * std::sqrt(std::max(dist, 0.0) / amax);
+      // 两端速度同时为零（例如整条路径只有一段）：该段就是静止到静止的梯形，
+      // 用其精确时长兜底。上游此处直接判定剖面不可用并返回空。
+      dt = 2.0 * std::sqrt(ds / amax);
     }
-    times.push_back(times.back() + std::max(dt, 0.05));
+    // 时长下界只为保证 MINCO 分段时间严格为正。退化零长段给 0.05 s，
+    // 正常段只给 1 ms —— 固定 0.05 s 的下界会在密路标点/高速时反而【拉长】总时长。
+    times.push_back(times.back() + std::max(dt, ds < 1e-6 ? 0.05 : 1.0e-3));
   }
   return times;
 }
 
+}  // namespace
+
+std::vector<double> cumulative_times(
+  const std::vector<Point2D> & points, double max_velocity, double max_acceleration,
+  double start_speed)
+{
+  std::vector<double> nodes;
+  nodes.reserve(points.size());
+  double arc_length = 0.0;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    if (i > 0) {
+      arc_length += distance_2d(points[i - 1], points[i]);
+    }
+    nodes.push_back(arc_length);
+  }
+  return integrate_reachable_times(nodes, max_velocity, max_acceleration, start_speed);
+}
+
 std::vector<double> cumulative_times_with_turning(
   const std::vector<Point2D> & points, double max_velocity, double max_acceleration,
-  double turn_weight)
+  double turn_weight, double start_speed)
 {
-  std::vector<double> times;
   if (points.empty()) {
-    return times;
+    return {};
   }
-  times.reserve(points.size());
-  times.push_back(0.0);
+  std::vector<double> nodes;
+  nodes.reserve(points.size());
+  nodes.push_back(0.0);
   if (points.size() == 1) {
-    return times;
+    return {0.0};
   }
 
-  const double vmax = std::max(max_velocity, 1e-3);
-  const double amax = std::max(max_acceleration, 1e-3);
-  const double t_acc = vmax / amax;
-  const double s_acc = 0.5 * amax * t_acc * t_acc;
   const double k_turn = std::max(0.0, turn_weight);
 
   for (std::size_t i = 1; i < points.size(); ++i) {
@@ -165,15 +216,9 @@ std::vector<double> cumulative_times_with_turning(
     }
     // 等效路程：直线段 + 转角等效行程。
     const double s = s1 + k_turn * s2;
-    double dt = 0.0;
-    if (s >= 2.0 * s_acc) {
-      dt = 2.0 * t_acc + (s - 2.0 * s_acc) / vmax;
-    } else {
-      dt = 2.0 * std::sqrt(std::max(s, 0.0) / amax);
-    }
-    times.push_back(times.back() + std::max(dt, 0.05));
+    nodes.push_back(nodes.back() + std::max(s, 0.0));
   }
-  return times;
+  return integrate_reachable_times(nodes, max_velocity, max_acceleration, start_speed);
 }
 
 }  // namespace astra_nav

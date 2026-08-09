@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # 规划功能包（对应报告 5.5.3 前端搜索与 5.5.4 MINCO 轨迹优化）：
-# JPS 前端、局部子目标选择、起终点清障、MINCO 轨迹表示、L-BFGS 优化、重规划。
+# 连续代价场空间 A* 前端、端点 BFS 重定位、MINCO 轨迹表示、L-BFGS 优化、重规划。
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -29,10 +29,8 @@ find_package(builtin_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(astra_planning
-  src/jps_planner.cpp
-  src/local_goal_selector.cpp
-  src/endpoint_projector.cpp
-  src/goal_reachability_resolver.cpp
+  src/spatial_grid_astar.cpp
+  src/endpoint_nudge.cpp
   src/replan_strategy.cpp
   src/minco_adapter.cpp
   src/minco_trajectory.cpp

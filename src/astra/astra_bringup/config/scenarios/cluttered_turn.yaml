@@ -8,7 +8,3 @@ sim_world_node:
     motion_enabled: true
     goal_x: 5.2
     goal_y: 2.2
-
-planner_node:
-  ros__parameters:
-    local_goal_backoff_distance: 0.45

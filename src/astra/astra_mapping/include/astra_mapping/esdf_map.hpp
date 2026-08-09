@@ -14,6 +14,7 @@ class EsdfMap
 {
 public:
   EsdfMap() = default;
+  // obstacles 为 0-255 连续代价场；代价 >= kOccupiedCostThreshold 的格视为障碍源。
   explicit EsdfMap(const Grid2D & obstacles);
 
   bool valid() const { return width_ > 0 && height_ > 0; }

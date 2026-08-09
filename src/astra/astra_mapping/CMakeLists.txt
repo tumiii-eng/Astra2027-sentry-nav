@@ -27,8 +27,12 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+# 连续代价场膨胀直接复用 HWSentryNav26 的 cv::distanceTransform / connectedComponentsWithStats。
+find_package(OpenCV REQUIRED)
 
 add_library(astra_mapping
+  src/map_utils.cpp
+  src/cost_map_sampler.cpp
   src/obstacle_extractor.cpp
   src/esdf_map.cpp
 )
@@ -36,7 +40,8 @@ target_include_directories(astra_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(astra_mapping Eigen3::Eigen)
+target_link_libraries(astra_mapping Eigen3::Eigen ${OpenCV_LIBS})
+target_include_directories(astra_mapping PUBLIC ${OpenCV_INCLUDE_DIRS})
 ament_target_dependencies(astra_mapping astra_common astra_perception)
 
 # 占据栅格 / 二维障碍图节点：订阅点云，维护三维占据栅格，发布二维障碍图。
@@ -57,7 +62,7 @@ install(DIRECTORY include/ DESTINATION include)
 ament_export_include_directories(include)
 ament_export_libraries(astra_mapping)
 ament_export_targets(export_astra_mapping HAS_LIBRARY_TARGET)
-ament_export_dependencies(astra_common astra_perception Eigen3)
+ament_export_dependencies(astra_common astra_perception Eigen3 OpenCV)
 
 if(BUILD_TESTING)
   add_executable(astra_mapping_test test/astra_mapping_test.cpp)

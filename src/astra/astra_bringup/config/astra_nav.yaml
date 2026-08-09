@@ -1,9 +1,3 @@
-astra_nav:
-  ros__parameters:
-    map_frame: odom
-    robot_frame: base_link
-    lidar_frame: lidar
-
 sim_world_node:
   ros__parameters:
     update_rate_hz: 20.0
@@ -12,13 +6,11 @@ sim_world_node:
     goal_y: 2.4
     max_range: 8.0
     obstacle_height: 0.8
-    point_noise_std: 0.01
 
 batch_liwo_proxy_node:
   ros__parameters:
     input_odom_topic: /sim/odom
     output_odom_topic: /astra/odom
-    use_input_twist: true
 
 occupancy_node:
   ros__parameters:
@@ -46,29 +38,35 @@ planner_node:
     goal_topic: /goal_pose
     path_topic: /astra/trajectory
     map_frame: odom
-    robot_radius: 0.28
-    safety_margin: 0.18
-    max_velocity: 1.5
-    max_acceleration: 1.6
+    # 连续代价场膨胀（对齐 HWSentryNav26 map_server global_map.inflation）。
+    # 没有 robot_radius/safety_margin 了：机器人在连续代价场里是一个质点，
+    # full_cost_radius_m 就是硬阻断半径（需覆盖车体半径），cutoff_radius_m 内是软代价。
+    inflation.full_cost_radius_m: 0.1
+    inflation.cutoff_radius_m: 0.3
+    inflation.decay_rate_per_m: 24.0
+    # 动态障碍层独立膨胀参数（对齐上游 local_map.inflation）。
+    dynamic_inflation.full_cost_radius_m: 0.2
+    dynamic_inflation.cutoff_radius_m: 0.4
+    dynamic_inflation.decay_rate_per_m: 16.0
+    # 对齐上游 capability_profiles.yaml 的 "medium" 档（mpc.follow.capability 用的就是它）：
+    # command_envelope.velocity.max = 2.2, command_dynamics.velocity_rate_max = 2.0。
+    # 上游 path_planner.yaml 的 velocity_max(3.0) 是几何塑形用的宽包络，真正约束速度剖面的
+    # 是 capability，故这里取 capability 的值。
+    max_velocity: 2.2
+    max_acceleration: 2.0
     waypoint_spacing: 0.35
     dynamic_time_scaling_enabled: true
     dynamic_time_scaling_max_iterations: 4
     dynamic_time_scaling_safety_ratio: 1.03
     replan_rate_hz: 5.0
     obstacle_cost_radius: 0.55
-    endpoint_projection_enabled: true
-    endpoint_search_radius: 1.2
-    endpoint_angle_samples: 72
-    goal_reachability_enabled: true
-    goal_reachability_search_radius: 1.5
-    local_goal_enabled: true
-    local_goal_backoff_distance: 0.35
-    local_goal_sample_step: 0.1
-    local_goal_min_progress_distance: 0.35
+    # 端点 BFS 重定位半径（对齐上游 path_planner endpoint nudge）。
+    endpoint_nudge_max_distance: 1.0
+    # 空间 A* 前端（对齐上游 spatial_a_star）。
+    spatial_a_star.obstacle_weight: 1.0
+    spatial_a_star.max_expansions: 1000000
     replan_start_position_inheritance_enabled: true
     replan_start_max_position_error: 0.18
-    replan_start_allow_projection_when_unsafe: true
-    replan_start_clearance_hysteresis: 0.04
     replan_start_transition_enabled: true
     replan_start_transition_max_position_error: 0.36
     short_path_hold_distance: 0.25
@@ -89,24 +87,55 @@ controller_node:
     path_topic: /astra/trajectory
     cmd_vel_topic: /cmd_vel
     control_rate_hz: 50.0
-    lookahead_time: 0.18
-    max_linear_velocity: 1.8
+    # 线速度上限与 planner_node.max_velocity 同源（上游跟随器的 ṡ 上界与速度剖面优化
+    # 用的是同一个 capability.command_envelope.velocity.max）。高于规划值等于在结构上
+    # 允许控制器跑出轨迹，是"冲出轨迹"的直接来源，故 1.8→1.5。
+    # 与 planner_node.max_velocity 严格相等（上游 medium 档 velocity.max = 2.2）。
+    max_linear_velocity: 2.2
     max_angular_velocity: 2.5
-    position_kp: 1.4
+    # 位置误差在参考点切/法向上分解后分别回正（上游 follow.tracking_weights.contour/lag，
+    # 上游默认等权 1.6）。替代旧的单一 position_kp——旧实现把误差取自"当前时刻+前瞻时间"
+    # 的参考点，1.5 m/s 下天生带 ~0.27 m 误差，乘 kp 变成常态超速指令。
+    contour_kp: 1.4
+    lag_kp: 1.4
     heading_kp: 2.2
-    # velocity_damping 现在阻尼【真实速度相对参考速度的超出量】(kd)，实现终点主动刹车(消除过冲/停不稳)。
-    # 0.15→0.6：旧值是配合"阻尼自身上一条命令"(无真实反馈)的软化系数，语义已变，须提到 PD 刹车增益量级。
+    # velocity_damping 阻尼【切向投影速度超出参考速度的部分】(kd)，对应上游 residual(3)
+    # (projected_velocity − path_speed_cmd)。只压超速不助加速，终点 v_ref→0 时自然刹车。
     velocity_damping: 0.6
     path_heading_tracking_enabled: false
     heading_startup_ramp_time: 0.8
     heading_error_deadband: 0.03
     heading_control_min_reference_speed: 0.05
+    # 到达判定双判据（上游 path_executor.misc.stop_threshold_dist 与
+    # stop_threshold_remaining_distance）：终点距离与剩余弧长须同时满足。
+    # 不再用参考速度做判据——速度剖面在急弯处也会低速，会被误判为到达。
     arrival_position_tolerance: 0.18
-    arrival_reference_speed_tolerance: 0.05
-    linear_command_accel_limit: 1.2
+    arrival_remaining_distance_tolerance: 0.18
+    # 须 >= planner_node.max_acceleration(2.0)，否则控制器跟不上轨迹加速段并积累纵向滞后。
+    # 上游速度剖面的 acceleration_upper 与跟随器的 ṡ 速率上界是同一个
+    # capability.command_dynamics.velocity_rate_max(2.0)，故这里取相等。
+    linear_command_accel_limit: 2.0
     angular_command_accel_limit: 2.0
     startup_velocity_error_grace_time: 0.6
+    # 轨迹终点移动超过该距离才算新的跟随任务并重计渐入宽限。
+    # 之前渐入判定挂在"单条轨迹发布时刻"上，5 Hz 重规划让它全程为真，把真正的超速 WARN 掩盖成 INFO。
+    new_task_goal_distance: 0.5
     tracking_log_period_ms: 1000
+    # —— (s, ṡ) 有向进度观测器（对齐 HWSentryNav26 task_manager.route_tracker）——
+    # 参考点不再按"轨迹发布以来的墙钟时间"取，而是由位置+地图系速度矢量共同观测出的
+    # 弧长进度换算得到，并保证进度单调不减；多假设竞争让错误分支被后续观测淘汰。
+    route_tracking_enabled: true
+    route_tracker.initial_search_distance: 0.5   # 新轨迹只允许在起点附近建立初始进度 (m)
+    route_tracker.max_tracking_error: 2.0        # 与参考点距离超过此值判为跟踪丢失 (m)
+    route_tracker.prediction_time_limit: 0.2     # 状态掉帧后最多积分这么久的路径速度 (s)
+    route_tracker.hypothesis_spacing: 0.05       # 进度候选弧长间距 (m)
+    route_tracker.max_hypotheses: 6              # 同时保留的竞争分支上限
+    route_tracker.hypothesis_prune_ratio: 3.0    # 代价超过领先假设该比例裕度的分支被淘汰
+    route_tracker.position_sigma: 0.20           # 位置观测标准差 (m)
+    route_tracker.velocity_sigma: 0.30           # 地图系速度矢量观测标准差 (m/s)
+    route_tracker.progress_sigma: 0.15           # 梯形积分进度模型标准差 (m)
+    route_tracker.profile_speed_sigma: 0.80      # 规划速度弱先验标准差 (m/s)
+    route_tracker.speed_dynamics_sigma: 0.30     # 路径速度帧间动态标准差 (m/s)
     tracking_error_warn_threshold: 0.35
     tracking_velocity_error_warn_threshold: 0.35
     mpc_preview_enabled: true

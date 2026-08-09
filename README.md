@@ -1,15 +1,17 @@
-# pb2025-astra-nav
+# Astra2027-sentry-nav
 
-把 MINCO 轨迹优化那套导航方案（2D ESDF + JPS 前端 + MINCO + L-BFGS 两步优化 + SE2 MPC）接到 RoboMaster 2025 哨兵仿真项目 [pb2025_sentry_nav](https://github.com/SMBU-PolarBear-Robotics-Team/pb2025_sentry_nav) 上，在 Gazebo Fortress 仿真里发目标点验证。
+把 MINCO 轨迹优化那套导航方案（连续代价场 + 空间 A\* 前端 + MINCO + L-BFGS 两步优化 + SE2 MPC）接到 RoboMaster 2025 哨兵仿真项目 [pb2025_sentry_nav](https://github.com/SMBU-PolarBear-Robotics-Team/pb2025_sentry_nav) 上，在 Gazebo Fortress 仿真里发目标点验证。
 
 仿真、里程计、重定位、地形感知这些底层全部沿用 pb2025 原生的那一套，Astra 只替换「规划 + 控制」这一层。所以同一套仿真下可以起两种导航来对照：
 
 | | 全局规划 | 控制 |
 | --- | --- | --- |
-| **A 套** Astra | JPS 前端 + MINCO 轨迹 + L-BFGS 优化 | SE2 MPC / preview 控制器 |
+| **A 套** Astra | 空间 A\* 前端 + MINCO 轨迹 + L-BFGS 优化 | SE2 MPC / preview 控制器 |
 | **B 套** pb2025 原生 | nav2 + Theta\* | omni PID pursuit |
 
 两套互斥，不能同时跑。
+
+规划与控制这一层的实现方法以开源项目 [HWSentryNav26](https://github.com/Polyacetone/HWSentryNav26) 为参考基准：遇到 Astra 与之做法不同、且 Astra 那侧确有问题的地方，一律改成对齐 HWSentryNav26 的方案（ROS API 仍用容器里的 Humble，不跟随其 Jazzy 版接口）。源码注释里标了「对应上游 …」的地方就是这类对齐点。
 
 ## 仓库里有什么
 
@@ -17,12 +19,12 @@
 
 ```
 src/astra/                      Astra 导航算法（10 个 ROS 2 包）
-├── astra_common/               通用数据结构与数学
+├── astra_common/               通用数据结构、数学、速度剖面时间分配
 ├── astra_third_party/          GCOPTER / DDR-opt 派生头文件（MIT）
 ├── astra_perception/           点云预处理、3D 滚动占据栅格
-├── astra_mapping/              障碍提取、2D ESDF、障碍图节点
-├── astra_planning/             JPS、局部目标、清障、MINCO、L-BFGS、规划节点
-├── astra_control/              轨迹跟踪控制器、底盘速度输出
+├── astra_mapping/              障碍提取、连续代价场、ESDF、代价场采样
+├── astra_planning/             空间 A*、端点重定位、重规划策略、MINCO、L-BFGS、规划节点
+├── astra_control/              进度观测器、轨迹跟踪控制器、底盘速度输出
 ├── astra_localization/         里程计接口代理
 ├── astra_simulation/           本地仿真世界节点
 ├── astra_bringup/              聚合 launch 与默认参数
@@ -56,7 +58,7 @@ docs/DEBUG_NOTES.md             调试笔记：已解决的问题、还没修的
 ### 1. 克隆并拉上游
 
 ```bash
-git clone https://github.com/tumiii-eng/pb2025-astra-nav.git pb2025_ws
+git clone https://github.com/tumiii-eng/Astra2027-sentry-nav.git pb2025_ws
 cd pb2025_ws
 sudo apt install python3-vcstool     # 没装的话
 ./tools/setup_upstream.sh
@@ -154,7 +156,7 @@ docker compose up -d --build
 docker compose exec dev bash -lc 'cd /workspace && colcon build --symlink-install'
 ```
 
-首次构建镜像十几分钟（含从源码编 small_gicp），29 个包编译也要一会儿。
+首次构建镜像十几分钟（含从源码编 small_gicp），39 个包（29 个上游 + 10 个 astra）编译也要一会儿。
 
 容器内工作空间挂在 `/workspace`，**不是** pb2025 上游 README 里写的 `/root/ros_ws`。compose 的服务名是 `dev`，容器名 `pb2025-dev`。
 
@@ -238,15 +240,24 @@ docker exec pb2025-dev bash -lc 'source /opt/ros/humble/setup.bash; source /work
 
 ### 关闭所有进程
 
-每轮测试完都要做，反复启停容易把环境搞脏。
+每轮测试完都要做，反复启停容易把环境搞脏。三条按顺序敲：
 
 ```bash
-docker exec pb2025-dev bash -lc 'ps aux | grep -E "ros2 launch|component_container|pointlio|ign_sim_pointcloud|loam_interface|sensor_scan|terrainAnalysis|fake_vel|global_obstacle|occupancy_node|planner_node|controller_node|batch_liwo|map_server|lifecycle|small_gicp|joy|rviz2" | grep -v grep | awk "{print \$2}" | xargs -r kill -9 2>/dev/null; sleep 2'
-docker exec pb2025-dev bash -lc 'ps aux | grep -E "ign gazebo|parameter_bridge|rmua19|ruby.*ign|referee|robot_state_publisher" | grep -v grep | awk "{print \$2}" | xargs -r kill -9 2>/dev/null; sleep 2'
-docker exec pb2025-dev bash -lc 'ps aux | grep -E "ign gazebo|pointlio|rviz2|global_obstacle|component_container" | grep -v grep | wc -l'   # 应输出 0
+docker exec pb2025-dev pkill -f 'ros2 launch|gz sim|gzserver|ign gazebo|planner_node|controller_node|global_obstacle_map_node|point_lio|pointlio_mapping|small_gicp|map_server|lifecycle_manager|terrain_analysis|terrainAnalysis|loam_interface|sensor_scan_generation|ign_sim_pointcloud_tool|fake_vel_transform|rviz2|referee_system|spawn_robot'
+sleep 3
+docker exec pb2025-dev pkill -9 -f 'gz sim|gzserver|ign gazebo|rviz2'
+sleep 2
+docker exec pb2025-dev pgrep -af 'gz sim|planner_node|controller_node|point_lio|rviz2|terrain_analysis|map_server|global_obstacle_map|small_gicp|loam_interface|fake_vel_transform'
 ```
 
-别用 `pkill -f ros2` 这种广播式清理，它会把你自己所在的 `docker exec` 父 shell 一起杀掉（exit 137），清理跑一半就断了。所以上面用精确进程名匹配 PID。真卡死了重启设备最干净。
+第三条**没有任何输出就是干净的**（`pgrep` 没匹配时返回退出码 1，属正常，不是报错）。
+
+两个坑，都踩过：
+
+- `pkill` **必须直接作为 `docker exec` 的目标**，不能包在 `bash -lc '...'` 里。包一层的话，整串正则会出现在那个包装 shell 自己的 `cmdline` 里，第一个 `pkill -f 'ros2 launch'` 就把自己所在的 shell 杀了，后面十几个 `pkill` 一个都执行不到，清理跑一半静默断掉。直接 exec 时 `pkill` 会自动把自己排除，安全。`planner_nod[e]` 这种加方括号的规避写法在这里也不管用——同一条命令行里仍然含有未加括号的字面量。
+- 正则不要放宽到裸 `ruby`（太广），`gz sim` 已经覆盖 Gazebo 启动器了。上面这串已经核对过不会匹配容器的 PID 1 与 `sleep infinity` 保活进程。
+
+真卡死了重启设备最干净。
 
 ## 数据流（A 套）
 
@@ -263,7 +274,9 @@ docker exec pb2025-dev bash -lc 'ps aux | grep -E "ign gazebo|pointlio|rviz2|glo
 
 Astra 节点跑在全局命名空间（不加 ns 前缀，这样裸键 yaml 参数才生效），通过话题 remap 接到 pb2025 的 `/red_standard_robot1/*`。TF 也 remap 到 `/<ns>/tf`。
 
-planner 内部的规划链：收到障碍图 → 转 `Grid2D` → 膨胀 → 建 ESDF → 目标经可达性判定/局部目标选择/端点投影处理 → JPS 前端搜路径 → MINCO 两步优化（L-BFGS）→ 发 `nav_msgs/Path`，时间信息编码在 `header.stamp` 里。
+planner 内部的规划链：收到障碍图 → 转 `Grid2D` → 建**连续代价场**（硬阻断半径 + 软代价衰减，对齐上游 `map_server` 的 inflation）→ 建 ESDF → 起点/终点做 BFS 重定位（`endpoint_nudge`）→ **空间 A\*** 前端搜路径 → MINCO 两步优化（L-BFGS）→ 发 `nav_msgs/Path`，时间信息编码在 `header.stamp` 里。
+
+轨迹的时间戳由**全路径速度剖面**给出，不是每个路标点单独安排一次「静止到静止」的梯形：先在速度² 上做前向（加速可达）/ 终点零速 / 后向（刹车可达）三趟传播，再按 `Δt = 2Δs/(v_i+v_{i+1})` 梯形积分。整条路径因此只有一次加速、一次巡航、一次刹车，速度跨路标点连续。重规划时还会继承当前速度在首段切向上的前向投影，避免 5 Hz 重规划每周期都从零速重新起步。这一套逐项对应上游 `speed_profile_optimizer.cpp` 的 `reachable_seed()` + `make_profile()`。
 
 ## 编译单个包
 
@@ -277,10 +290,11 @@ docker exec pb2025-dev bash -lc 'source /opt/ros/humble/setup.bash; source /work
 
 ## 已知问题
 
-调试过程、已解决的问题和还没修的 BUG 都在 [docs/DEBUG_NOTES.md](docs/DEBUG_NOTES.md)。当前还开着的：
+调试过程、已解决的问题和还没修的 BUG 都在 [docs/DEBUG_NOTES.md](docs/DEBUG_NOTES.md)。
 
-- **飞车 + 路径不忠诚**：根因定位在 `global_obstacle_map_node.cpp` 摄入 terrain_map 时只设了 intensity 下限、没有上限，异常高 intensity 的点把可通行地面污染成障碍，进而触发正反馈崩溃。修法已定，等实测数据坐实。
-- **目标处理链缺连通性判据**：只判目标单点离障碍够远，不判起点到目标是否连通，合法但不连通的远目标必然规划失败。
+上一版记的两条已经修完了：飞车根因（`global_obstacle_map_node` 缺 intensity 上限）已加双边门限；目标处理链缺连通性判据已换成起终点 BFS 重定位。当前待办：
+
+- **速度提升尚未做仿真实测**：本版把速度剖面改成全路径可达传播、上限提到上游 medium 档（2.2 / 2.0），单元测试里平均速度已从 vmax 的 ~25% 提到 93%，但控制增益（`contour_kp` / `lag_kp` / `velocity_damping`）还是按 1.5 m/s 标的，需要按实测的横向误差 / 终点过冲再标一轮。
 
 ## 许可
 

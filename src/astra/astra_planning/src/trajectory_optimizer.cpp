@@ -7,25 +7,44 @@
 namespace astra_nav
 {
 
+namespace
+{
+
+// 继承速度在首段切向上的前向投影，逆向分量取 0。
+// 对应上游 SpeedProfileOptimizer::optimize 里的
+// std::max(0.0, current_velocity_map.dot(tangent))（speed_profile_optimizer.cpp:573）。
+double projected_start_speed(const Point2D & velocity, const Point2D & from, const Point2D & to)
+{
+  const double dx = to.x - from.x;
+  const double dy = to.y - from.y;
+  const double dn = std::hypot(dx, dy);
+  if (dn < 1.0e-6) {
+    return 0.0;
+  }
+  return std::max(0.0, (velocity.x * dx + velocity.y * dy) / dn);
+}
+
+}  // namespace
+
 TrajectoryOptimizer::TrajectoryOptimizer(const TrajectoryOptimizerConfig & config)
 : config_(config)
 {
 }
 
 MincoTrajectory TrajectoryOptimizer::optimize(
-  const std::vector<Point2D> & coarse_path, const EsdfMap & esdf) const
+  const std::vector<Point2D> & coarse_path, const Grid2D & cost_map, const EsdfMap & esdf) const
 {
-  return optimize_with_stats(coarse_path, esdf).trajectory;
+  return optimize_with_stats(coarse_path, cost_map, esdf).trajectory;
 }
 
 TrajectoryOptimizationResult TrajectoryOptimizer::optimize_with_stats(
-  const std::vector<Point2D> & coarse_path, const EsdfMap & esdf) const
+  const std::vector<Point2D> & coarse_path, const Grid2D & cost_map, const EsdfMap & esdf) const
 {
-  return optimize_with_stats(coarse_path, esdf, {});
+  return optimize_with_stats(coarse_path, cost_map, esdf, {});
 }
 
 TrajectoryOptimizationResult TrajectoryOptimizer::optimize_with_stats(
-  const std::vector<Point2D> & coarse_path, const EsdfMap & esdf,
+  const std::vector<Point2D> & coarse_path, const Grid2D & cost_map, const EsdfMap & esdf,
   const TrajectoryBoundaryCondition & boundary_condition) const
 {
   TrajectoryOptimizationResult output;
@@ -36,7 +55,7 @@ TrajectoryOptimizationResult TrajectoryOptimizer::optimize_with_stats(
 
   // 新后端：基于 MINCO 控制点与分段时间梯度的两步优化（报告 5.5.4）。
   if (config_.use_minco_backend) {
-    return optimize_minco_backend(coarse_path, esdf, boundary_condition);
+    return optimize_minco_backend(coarse_path, cost_map, esdf, boundary_condition);
   }
 
   const auto start_time = std::chrono::steady_clock::now();
@@ -44,7 +63,12 @@ TrajectoryOptimizationResult TrajectoryOptimizer::optimize_with_stats(
   output.stats.resampled_points = static_cast<int>(waypoints.size());
   auto pre = optimize_waypoints(waypoints, esdf, config_.pre_iterations, 0.7);
   auto fine = optimize_waypoints(pre.points, esdf, config_.fine_iterations, 1.0);
-  auto times = cumulative_times(fine.points, config_.max_velocity, config_.max_acceleration);
+  const double legacy_start_speed = boundary_condition.inherit_start_state &&
+    fine.points.size() >= 2
+    ? projected_start_speed(boundary_condition.start_velocity, fine.points[0], fine.points[1])
+    : 0.0;
+  auto times = cumulative_times(
+    fine.points, config_.max_velocity, config_.max_acceleration, legacy_start_speed);
   if (config_.initial_time_scale > 1.0e-3 && config_.initial_time_scale < 1.0 - 1.0e-6) {
     scale_times(times, config_.initial_time_scale);
   }
@@ -99,14 +123,12 @@ MincoOptimizerConfig TrajectoryOptimizer::make_minco_config() const
   MincoOptimizerConfig cfg;
   cfg.max_velocity = config_.max_velocity;
   cfg.max_acceleration = config_.max_acceleration;
-  cfg.safe_distance = config_.obstacle_cost_radius;
   cfg.weight_energy = config_.minco_weight_energy;
   cfg.weight_time = config_.minco_weight_time;
   cfg.weight_obstacle = config_.minco_weight_obstacle;
   cfg.weight_velocity = config_.minco_weight_velocity;
   cfg.weight_acceleration = config_.minco_weight_acceleration;
   cfg.weight_uniform_time = config_.minco_weight_uniform_time;
-  cfg.valley_gradient_threshold = config_.minco_valley_gradient_threshold;
   cfg.samples_per_piece = config_.minco_samples_per_piece;
   cfg.memory_size = config_.lbfgs_memory_size;
   cfg.past = config_.lbfgs_past;
@@ -116,7 +138,7 @@ MincoOptimizerConfig TrajectoryOptimizer::make_minco_config() const
 }
 
 TrajectoryOptimizationResult TrajectoryOptimizer::optimize_minco_backend(
-  const std::vector<Point2D> & coarse_path, const EsdfMap & esdf,
+  const std::vector<Point2D> & coarse_path, const Grid2D & cost_map, const EsdfMap & esdf,
   const TrajectoryBoundaryCondition & boundary_condition) const
 {
   TrajectoryOptimizationResult output;
@@ -130,8 +152,15 @@ TrajectoryOptimizationResult TrajectoryOptimizer::optimize_minco_backend(
     return output;
   }
   output.stats.resampled_points = static_cast<int>(waypoints.size());
+  // 起点速度取继承速度在首段切向上的【前向投影】（上游 SpeedProfileOptimizer 用
+  // current_velocity_map.dot(tangent) 并对负值取 0）。不传起点速度的话，5 Hz 重规划
+  // 每一轮都会把剖面重排成"从静止起步"，机器人永远跑在加速段起点上。
+  const double start_speed = boundary_condition.inherit_start_state
+    ? projected_start_speed(boundary_condition.start_velocity, waypoints[0], waypoints[1])
+    : 0.0;
   auto times = cumulative_times_with_turning(
-    waypoints, config_.max_velocity, config_.max_acceleration, config_.turn_time_weight);
+    waypoints, config_.max_velocity, config_.max_acceleration, config_.turn_time_weight,
+    start_speed);
 
   // 2) 边界状态：起点可继承上一轨迹的速度/加速度（重规划连续性），终点静止。
   MincoBoundaryState head;
@@ -156,7 +185,7 @@ TrajectoryOptimizationResult TrajectoryOptimizer::optimize_minco_backend(
   MincoOptimizer pre_optimizer(pre_config);
 
   auto pre = pre_optimizer.optimize(
-    waypoints, times, head, tail, esdf, MincoOptimizeStage::PreOptimization);
+    waypoints, times, head, tail, cost_map, MincoOptimizeStage::PreOptimization);
   output.stats.pre_lbfgs_status = pre.status;
   output.stats.pre_lbfgs_iterations = pre.iterations;
   output.stats.pre_initial_cost = pre.initial_cost;
@@ -193,13 +222,12 @@ TrajectoryOptimizationResult TrajectoryOptimizer::optimize_minco_backend(
   fine_config.max_iterations = config_.minco_fine_iterations;
   MincoOptimizer fine_optimizer(fine_config);
   auto fine = fine_optimizer.optimize(
-    fine_waypoints, fine_times, head, tail, esdf, MincoOptimizeStage::FinelyOptimization);
+    fine_waypoints, fine_times, head, tail, cost_map, MincoOptimizeStage::FinelyOptimization);
   output.stats.fine_lbfgs_status = fine.status;
   output.stats.fine_lbfgs_iterations = fine.iterations;
   output.stats.fine_initial_cost = fine.initial_cost;
   output.stats.fine_final_cost = fine.final_cost;
   output.stats.fine_optimized = fine.optimized;
-  output.stats.finely_valley_hits = fine.valley_hits;
 
   // FINELY 成功则采用其结果，否则回退到 PRE 结果。
   output.trajectory = !fine.trajectory.empty() ? fine.trajectory : pre_trajectory;

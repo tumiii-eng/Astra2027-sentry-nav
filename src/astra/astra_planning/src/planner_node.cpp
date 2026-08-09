@@ -17,11 +17,9 @@
 #include "astra_common/common.hpp"
 #include "astra_mapping/esdf_map.hpp"
 #include "astra_mapping/obstacle_extractor.hpp"
-#include "astra_planning/endpoint_projector.hpp"
-#include "astra_planning/goal_reachability_resolver.hpp"
-#include "astra_planning/jps_planner.hpp"
-#include "astra_planning/local_goal_selector.hpp"
+#include "astra_planning/endpoint_nudge.hpp"
 #include "astra_planning/replan_strategy.hpp"
+#include "astra_planning/spatial_grid_astar.hpp"
 #include "astra_planning/trajectory_optimizer.hpp"
 
 namespace astra_nav
@@ -48,26 +46,35 @@ public:
     odom_topic_ = declare_parameter<std::string>("odom_topic", "/astra/odom");
     obstacle_grid_topic_ =
       declare_parameter<std::string>("obstacle_grid_topic", "/astra/obstacle_grid");
+    // 动态障碍层（可为空字符串=不订阅，此时只用静态层）。两层分开进来才能各自膨胀。
+    dynamic_grid_topic_ = declare_parameter<std::string>("dynamic_grid_topic", "");
     goal_topic_ = declare_parameter<std::string>("goal_topic", "/goal_pose");
     path_topic_ = declare_parameter<std::string>("path_topic", "/astra/trajectory");
     map_frame_ = declare_parameter<std::string>("map_frame", "odom");
-    robot_radius_ = declare_parameter("robot_radius", 0.28);
-    safety_margin_ = declare_parameter("safety_margin", 0.18);
+    // 连续代价场膨胀参数（对齐 HWSentryNav26 map_server global_map.inflation）。
+    // full_cost_radius_m 是硬阻断半径，应覆盖车体半径；cutoff_radius_m 之内为软代价，
+    // 只加权边代价、为下游梯度优化器提供远处可见的连续约束，不阻断连通性。
+    inflation_params_.full_cost_radius_m = declare_parameter("inflation.full_cost_radius_m", 0.1);
+    inflation_params_.cutoff_radius_m = declare_parameter("inflation.cutoff_radius_m", 0.3);
+    inflation_params_.decay_rate_per_m = declare_parameter("inflation.decay_rate_per_m", 24.0);
+    // 动态障碍膨胀参数独立于静态（对齐 HWSentryNav26 map_server local_map.inflation）。
+    // 动态障碍位置有观测噪声、且会移动，需要更大的满代价半径与更缓的衰减；静态先验
+    // 地图是精确的，用更紧的膨胀以免切断窄走廊连通性。
+    dynamic_inflation_params_.full_cost_radius_m =
+      declare_parameter("dynamic_inflation.full_cost_radius_m", 0.2);
+    dynamic_inflation_params_.cutoff_radius_m =
+      declare_parameter("dynamic_inflation.cutoff_radius_m", 0.4);
+    dynamic_inflation_params_.decay_rate_per_m =
+      declare_parameter("dynamic_inflation.decay_rate_per_m", 16.0);
     replan_rate_hz_ = declare_parameter("replan_rate_hz", 5.0);
-    endpoint_projection_enabled_ = declare_parameter("endpoint_projection_enabled", true);
-    endpoint_search_radius_ = declare_parameter("endpoint_search_radius", 1.2);
-    endpoint_angle_samples_ = declare_parameter("endpoint_angle_samples", 72);
-    local_goal_enabled_ = declare_parameter("local_goal_enabled", true);
-    local_goal_backoff_distance_ = declare_parameter("local_goal_backoff_distance", 0.35);
-    local_goal_sample_step_ = declare_parameter("local_goal_sample_step", 0.1);
-    local_goal_min_progress_distance_ = declare_parameter("local_goal_min_progress_distance", 0.35);
+    // 端点 BFS 重定位半径（对齐 HWSentryNav26 path_planner endpoint.nudge_max_distance）。
+    endpoint_nudge_max_distance_ = declare_parameter("endpoint_nudge_max_distance", 1.0);
+    // 空间 A* 参数（对齐 HWSentryNav26 path_planner spatial_a_star）。
+    astar_obstacle_weight_ = declare_parameter("spatial_a_star.obstacle_weight", 1.0);
+    astar_max_expansions_ = declare_parameter("spatial_a_star.max_expansions", 1000000);
     replan_start_position_inheritance_enabled_ =
       declare_parameter("replan_start_position_inheritance_enabled", true);
     replan_start_max_position_error_ = declare_parameter("replan_start_max_position_error", 0.18);
-    replan_start_allow_projection_when_unsafe_ =
-      declare_parameter("replan_start_allow_projection_when_unsafe", true);
-    replan_start_clearance_hysteresis_ =
-      declare_parameter("replan_start_clearance_hysteresis", 0.04);
     replan_start_transition_enabled_ = declare_parameter("replan_start_transition_enabled", true);
     replan_start_transition_max_position_error_ =
       declare_parameter("replan_start_transition_max_position_error", 0.36);
@@ -87,11 +94,7 @@ public:
       declare_parameter("replan_localization_deviation_threshold", 0.6);
     replan_good_tracking_threshold_ = declare_parameter("replan_good_tracking_threshold", 0.25);
 
-    // 目标点可达性 BFS/DFS 重定位参数（报告 5.5.4.4 流程图右上“目标点优化”）。
-    goal_reachability_enabled_ = declare_parameter("goal_reachability_enabled", true);
-    goal_reachability_search_radius_ = declare_parameter("goal_reachability_search_radius", 1.5);
-
-    // BUG-4：把 JPS 真正搜索用的膨胀图发布出来（RViz 里 /astra/global_obstacle_grid 不是搜索图）。
+    // BUG-4：把前端真正搜索用的代价图发布出来（RViz 里 /astra/global_obstacle_grid 不是搜索图）。
     publish_inflated_grid_ = declare_parameter("publish_inflated_grid", false);
     inflated_grid_topic_ =
       declare_parameter<std::string>("inflated_grid_topic", "/astra/planner_inflated_grid");
@@ -113,6 +116,13 @@ public:
         latest_grid_ = *msg;
         has_grid_ = true;
       });
+    if (!dynamic_grid_topic_.empty()) {
+      dynamic_grid_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        dynamic_grid_topic_, 5, [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+          latest_dynamic_grid_ = *msg;
+          has_dynamic_grid_ = true;
+        });
+    }
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       goal_topic_, 5, [this](geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         goal_.x = msg->pose.position.x;
@@ -182,14 +192,31 @@ private:
       return;
     }
 
+    // 静态层与动态层各按自己的参数膨胀一次，再逐格取 max 合并成一张硬代价场。
+    // 对齐 HWSentryNav26 obstacle_semantics 的 hard_cost = global_static->merge(dynamic_union)，
+    // merge 就是逐格 std::max。
     const auto grid = occupancy_msg_to_grid(latest_grid_);
-    const int inflate_cells = static_cast<int>(
-      std::ceil((robot_radius_ + safety_margin_) / std::max(grid.resolution, 1e-3)));
-    const auto inflated = ObstacleExtractor::inflate(grid, inflate_cells);
+    auto inflated = ObstacleExtractor::inflate(grid, inflation_params_);
+    if (has_dynamic_grid_) {
+      const auto dynamic_grid = occupancy_msg_to_grid(latest_dynamic_grid_);
+      if (dynamic_grid.width == inflated.width && dynamic_grid.height == inflated.height) {
+        const auto dynamic_inflated =
+          ObstacleExtractor::inflate(dynamic_grid, dynamic_inflation_params_);
+        for (std::size_t i = 0; i < inflated.data.size(); ++i) {
+          inflated.data[i] = std::max(inflated.data[i], dynamic_inflated.data[i]);
+        }
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "动态障碍层几何与静态层不一致，本轮忽略动态层：静态=%dx%d，动态=%dx%d。",
+          inflated.width, inflated.height, dynamic_grid.width, dynamic_grid.height);
+      }
+    }
     if (publish_inflated_grid_ && inflated_grid_pub_) {
       publish_grid_as_occupancy(inflated);
     }
-    EsdfMap esdf(grid);
+    // ESDF 只用于重规划模式选择与轨迹质量统计；障碍源取合并后的硬占用格。
+    EsdfMap esdf(inflated);
     const auto planning_stamp = now();
     const Point2D current_position{pose_.x, pose_.y};
 
@@ -204,137 +231,63 @@ private:
     const auto replan_start = select_replan_start(
       current_position, planning_stamp, esdf, allow_inheritance);
     Point2D plan_start = replan_start.point;
-    bool start_clearance_hysteresis_kept = false;
-    if (endpoint_projection_enabled_) {
-      const double start_clearance_hysteresis = replan_start_clearance_hysteresis_for(replan_start);
-      EndpointProjector projector(make_endpoint_projector_config(
-          start_clearance_hysteresis, start_clearance_hysteresis > 0.0));
-      const auto start_projection = projector.project(plan_start, inflated, esdf);
-      if (!start_projection.success) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "规划起点清障失败，暂不规划：原始距离=%.3f m，最佳距离=%.3f m，位移=%.3f m。",
-          start_projection.original_distance, start_projection.projected_distance,
-          start_projection.displacement);
-        return;
-      }
-      if (start_projection.moved) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "规划起点已清障：位移=%.3f m，距离 %.3f->%.3f m。",
-          start_projection.displacement, start_projection.original_distance,
-          start_projection.projected_distance);
-      } else if (
-        start_clearance_hysteresis > 0.0 &&
-        start_projection.original_distance < optimizer_config_.obstacle_cost_radius)
-      {
-        start_clearance_hysteresis_kept = true;
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "重规划起点清障滞回生效：来源=%s，距离=%.3f m，要求=%.3f m，容差=%.3f m，保持连续起点不投影。",
-          replan_start_kind_name(replan_start.kind), start_projection.original_distance,
-          optimizer_config_.obstacle_cost_radius, start_clearance_hysteresis);
-      }
-      plan_start = start_projection.point;
-      if (should_publish_start_escape(current_position, plan_start, start_projection.moved)) {
-        publish_start_escape_path(current_position, plan_start, planning_stamp, "规划起点清障距离较大");
-        return;
-      }
+    // 起点端点门控（对齐 HWSentryNav26 path_planner::plan 的起点检查 + nudge）：
+    // 只做“地图足迹内 + BFS 推到最近硬通行格”，不再按 ESDF 安全距离做射线投影。
+    // 硬安全边界已经由连续代价场的 full_cost_radius_m 承担，端点只需满足
+    // A* 的前置条件 grid_cell_traversable，其余贴障惩罚交给软代价与优化器。
+    const auto nudged_start = nudge_point_to_free(inflated, plan_start, endpoint_nudge_max_distance_);
+    if (!nudged_start) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "规划起点无法推到可行格，暂不规划：起点=(%.3f, %.3f)，搜索半径=%.3f m。",
+        plan_start.x, plan_start.y, endpoint_nudge_max_distance_);
+      return;
+    }
+    const double start_nudge_displacement = distance_2d(plan_start, *nudged_start);
+    const bool start_nudged = start_nudge_displacement > 1.0e-6;
+    if (start_nudged) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "规划起点已推到可行格：来源=%s，位移=%.3f m，(%.3f, %.3f)->(%.3f, %.3f)。",
+        replan_start_kind_name(replan_start.kind), start_nudge_displacement,
+        plan_start.x, plan_start.y, nudged_start->x, nudged_start->y);
+    }
+    plan_start = *nudged_start;
+    if (should_publish_start_escape(current_position, plan_start, start_nudged)) {
+      publish_start_escape_path(current_position, plan_start, planning_stamp, "规划起点脱困位移较大");
+      return;
     }
 
+    // 目标端点门控（对齐 HWSentryNav26 path_planner::plan 的终点检查 + nudge）：
+    // 与起点同一套 BFS，不再有 BFS 种子 + DFS 梯度爬升的可达性重定位，
+    // 也不再把全局目标裁剪成局部子目标——A* 在连续代价场上直接搜到全局目标，
+    // 搜不通才是真的不通，此时如实报错而不是先自行缩短目标。
     Point2D plan_goal = goal_;
-    // 目标点可达性检测与重定位（报告 5.5.4.4 流程图右上“目标点优化”）：
-    // 全局目标若不可达（埋在障碍内或贴障碍不足安全距离），先用 BFS 找到附近第一个
-    // ESDF 为正的种子点，再用 DFS 沿梯度方向扩展到第一个满足安全距离的可达点，
-    // 然后才进入后续局部子目标选择与规划。可达则原样直通。
-    Point2D reachable_goal = goal_;
-    if (goal_reachability_enabled_) {
-      GoalReachabilityConfig reach_config;
-      reach_config.required_clearance = optimizer_config_.obstacle_cost_radius;
-      reach_config.max_search_radius = goal_reachability_search_radius_;
-      GoalReachabilityResolver resolver(reach_config);
-      const auto reach = resolver.resolve(goal_, esdf);
-      if (!reach.success) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "全局目标不可达且重定位失败，暂不规划：目标=(%.3f, %.3f)，原始距离=%.3f m，BFS扩展=%d，DFS扩展=%d。",
-          goal_.x, goal_.y, reach.original_distance, reach.bfs_expansions, reach.dfs_expansions);
-        return;
-      }
-      if (reach.relocated) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "全局目标不可达，已重定位：原目标=(%.3f, %.3f)->新目标=(%.3f, %.3f)，位移=%.3f m，距离 %.3f->%.3f m，BFS=%s/%d，DFS=%s/%d。",
-          goal_.x, goal_.y, reach.point.x, reach.point.y, reach.displacement,
-          reach.original_distance, reach.final_distance,
-          reach.bfs_used ? "是" : "否", reach.bfs_expansions,
-          reach.dfs_used ? "是" : "否", reach.dfs_expansions);
-      }
-      reachable_goal = reach.point;
-      plan_goal = reachable_goal;
+    const auto nudged_goal = nudge_point_to_free(inflated, plan_goal, endpoint_nudge_max_distance_);
+    if (!nudged_goal) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "规划目标点无法推到可行格，暂不规划：目标=(%.3f, %.3f)，搜索半径=%.3f m。",
+        plan_goal.x, plan_goal.y, endpoint_nudge_max_distance_);
+      return;
     }
-    if (local_goal_enabled_) {
-      LocalGoalSelectorConfig local_goal_config;
-      local_goal_config.required_clearance =
-        start_clearance_hysteresis_kept ?
-        std::max(0.0, optimizer_config_.obstacle_cost_radius - replan_start_clearance_hysteresis_) :
-        optimizer_config_.obstacle_cost_radius;
-      local_goal_config.backoff_distance = local_goal_backoff_distance_;
-      local_goal_config.sample_step = local_goal_sample_step_;
-      local_goal_config.min_progress_distance = local_goal_min_progress_distance_;
-      local_goal_config.require_grid_free = !start_clearance_hysteresis_kept;
-      LocalGoalSelector selector(local_goal_config);
-      if (start_clearance_hysteresis_kept) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "局部子目标选择沿用重规划起点滞回阈值：要求距离 %.3f m，按 ESDF 连续距离判断候选点。",
-          local_goal_config.required_clearance);
-      }
-      const auto local_goal = selector.select(plan_start, reachable_goal, inflated, esdf);
-      if (!local_goal.success) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "局部子目标选择失败，全局目标暂不可达：目标=(%.3f, %.3f)。",
-          reachable_goal.x, reachable_goal.y);
-        return;
-      }
-      if (local_goal.clipped) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "全局目标已裁剪为局部子目标：局部目标=(%.3f, %.3f)，进度=%.2f%%，距全局目标=%.3f m。",
-          local_goal.local_goal.x, local_goal.local_goal.y, local_goal.progress_ratio * 100.0,
-          local_goal.distance_to_global_goal);
-      }
-      plan_goal = local_goal.local_goal;
+    if (distance_2d(plan_goal, *nudged_goal) > 1.0e-6) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "规划目标点已推到可行格：位移=%.3f m，(%.3f, %.3f)->(%.3f, %.3f)。",
+        distance_2d(plan_goal, *nudged_goal),
+        plan_goal.x, plan_goal.y, nudged_goal->x, nudged_goal->y);
     }
-    if (endpoint_projection_enabled_) {
-      EndpointProjector projector(make_endpoint_projector_config());
-      const auto goal_projection = projector.project(plan_goal, inflated, esdf);
-      if (!goal_projection.success) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "规划目标点清障失败，暂不规划：原始距离=%.3f m，最佳距离=%.3f m，位移=%.3f m。",
-          goal_projection.original_distance, goal_projection.projected_distance,
-          goal_projection.displacement);
-        return;
-      }
-      if (goal_projection.moved) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "规划目标点已清障：位移=%.3f m，距离 %.3f->%.3f m。",
-          goal_projection.displacement,
-          goal_projection.original_distance, goal_projection.projected_distance);
-      }
-      plan_goal = goal_projection.point;
-    }
+    plan_goal = *nudged_goal;
+
     if (distance_2d(plan_start, plan_goal) <= short_path_hold_distance_) {
       publish_hold_path(plan_goal, planning_stamp, "规划起点与目标点距离过近");
       return;
     }
 
     // 三种重规划模式构造优化器输入路点的方式不同（报告 5.5.4.4）：
-    //   - 仅优化：不重新 JPS，直接取上一轨迹从映射点到末端的前方部分等间距重采样；
-    //   - 完全/部分重规划：JPS 前端搜索（完全=当前位置->目标，部分=映射点->目标）。
+    //   - 仅优化：不重新搜索，直接取上一轨迹从映射点到末端的前方部分等间距重采样；
+    //   - 完全/部分重规划：空间 A* 前端搜索（完全=当前位置->目标，部分=映射点->目标）。
     // 三者随后都汇入相同的 MINCO 两步优化与发布流程。
     std::vector<Point2D> planning_points;
     const bool optimize_only =
@@ -343,32 +296,41 @@ private:
     if (optimize_only) {
       planning_points = resample_previous_forward(replan_decision.mapped_t, plan_goal);
       if (planning_points.size() < 2) {
-        // 仅优化无法构造足够路点时，退化到 JPS 重规划兜底。
+        // 仅优化无法构造足够路点时，退化到重新搜索兜底。
         planning_points.clear();
       }
     }
 
     if (planning_points.empty()) {
-      JpsPlanner jps(inflated);
-      const auto coarse_path = jps.plan(plan_start, plan_goal);
-      if (!coarse_path) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "JPS 未找到可行路径，保持上一条轨迹。");
+      SpatialGridAstar::Params astar_params;
+      astar_params.obstacle_weight = astar_obstacle_weight_;
+      astar_params.max_expansions = astar_max_expansions_;
+      SpatialGridAstar astar(inflated, astar_params);
+      const auto astar_result = astar.plan(plan_start, plan_goal);
+      if (!astar_result.success) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "空间 A* 未找到可行路径，保持上一条轨迹：原因=%s，扩展=%d，open峰值=%zu。",
+          astar_result.error.c_str(), astar_result.route.expansions, astar_result.route.open_peak);
         return;
       }
-      planning_points = restore_planning_endpoints(coarse_path->world_points, plan_start, plan_goal);
+      planning_points =
+        restore_planning_endpoints(astar_result.route.world_points, plan_start, plan_goal);
       if (planning_points.size() < 2) {
         if (distance_2d(plan_start, plan_goal) <= 2.0 * short_path_hold_distance_) {
-          publish_hold_path(plan_goal, planning_stamp, "JPS 返回近距离短路径");
+          publish_hold_path(plan_goal, planning_stamp, "空间 A* 返回近距离短路径");
           return;
         }
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "JPS 路径点数量不足，暂不发布轨迹。");
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000, "空间 A* 路径点数量不足，暂不发布轨迹。");
         return;
       }
     }
 
     const auto publish_stamp = planning_stamp;
     const auto boundary_condition = make_boundary_condition(publish_stamp);
-    const auto result = optimizer_.optimize_with_stats(planning_points, esdf, boundary_condition);
+    const auto result =
+      optimizer_.optimize_with_stats(planning_points, inflated, esdf, boundary_condition);
     const auto samples = result.trajectory.sample(0.08);
     if (samples.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "轨迹优化输出为空，暂不发布轨迹。");
@@ -376,13 +338,12 @@ private:
     }
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "轨迹优化统计：输入点=%d，重采样点=%d，耗时=%.2f ms，预优化=%s(%d)/%d次，精优化=%s(%d)/%d次，势谷命中=%d，时间缩放=%d次/%.3f倍，最小障碍距离=%.3f m，最大速度=%.3f m/s，速度超限=%.3f m/s，最大加速度=%.3f m/s^2，加速度超限=%.3f m/s^2。",
+      "轨迹优化统计：输入点=%d，重采样点=%d，耗时=%.2f ms，预优化=%s(%d)/%d次，精优化=%s(%d)/%d次，时间缩放=%d次/%.3f倍，最小障碍距离=%.3f m，最大速度=%.3f m/s，速度超限=%.3f m/s，最大加速度=%.3f m/s^2，加速度超限=%.3f m/s^2。",
       result.stats.input_points, result.stats.resampled_points, result.stats.optimize_time_ms,
       lbfgs_status_text(result.stats.pre_lbfgs_status),
       result.stats.pre_lbfgs_status, result.stats.pre_lbfgs_iterations,
       lbfgs_status_text(result.stats.fine_lbfgs_status),
       result.stats.fine_lbfgs_status, result.stats.fine_lbfgs_iterations,
-      result.stats.finely_valley_hits,
       result.stats.time_scaling_iterations, result.stats.time_scaling_factor,
       result.stats.quality.min_esdf_distance, result.stats.quality.max_velocity,
       result.stats.quality.velocity_violation, result.stats.quality.max_acceleration,
@@ -404,13 +365,13 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "轨迹回环诊断：最大滑窗净转角=%.1f 度，仍含回环=%s，已自动恢复=%s，回环位置=(%.3f, %.3f)，"
-        "当前重规划模式继承起点=%s，势谷命中=%d，时间缩放=%d次。",
+        "当前重规划模式继承起点=%s，时间缩放=%d次。",
         result.stats.loop_max_window_angle * 180.0 / M_PI,
         result.stats.loop_detected ? "是" : "否",
         result.stats.loop_recovered ? "是" : "否",
         result.stats.loop_position_x, result.stats.loop_position_y,
         result.stats.start_state_inherited ? "是" : "否",
-        result.stats.finely_valley_hits, result.stats.time_scaling_iterations);
+        result.stats.time_scaling_iterations);
     }
 
     log_replan_continuity(result.trajectory, publish_stamp);
@@ -607,18 +568,6 @@ private:
     }
   }
 
-  double replan_start_clearance_hysteresis_for(const ReplanStartSelection & selection) const
-  {
-    if (replan_start_clearance_hysteresis_ <= 0.0) {
-      return 0.0;
-    }
-
-    if (selection.kind == ReplanStartKind::CurrentPose && !has_previous_trajectory_) {
-      return 0.0;
-    }
-    return replan_start_clearance_hysteresis_;
-  }
-
   // 计算本轮重规划模式决策（报告 5.5.4.4 模式选择）。
   ReplanDecision decide_replan_mode(const Point2D & current_position, const EsdfMap & esdf) const
   {
@@ -684,29 +633,17 @@ private:
         const double transition_clearance =
           esdf.valid() ? esdf.query_distance(transition.x, transition.y) :
           std::numeric_limits<double>::infinity();
-        if (transition_clearance >= optimizer_config_.obstacle_cost_radius ||
-          (endpoint_projection_enabled_ && replan_start_allow_projection_when_unsafe_))
-        {
-          RCLCPP_INFO_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "重规划起点使用过渡继承：当前位置=(%.3f, %.3f)，继承点=(%.3f, %.3f)，过渡点=(%.3f, %.3f)，原偏差=%.3f m，新起点距机器人=%.3f m。",
-            current_position.x, current_position.y, inherited_position.x, inherited_position.y,
-            transition.x, transition.y, position_error, distance_2d(current_position, transition));
-          if (transition_clearance < optimizer_config_.obstacle_cost_radius) {
-            RCLCPP_INFO_THROTTLE(
-              get_logger(), *get_clock(), 2000,
-              "重规划过渡起点安全距离不足，交由清障投影处理：距离=%.3f m，要求=%.3f m。",
-              transition_clearance, optimizer_config_.obstacle_cost_radius);
-          }
-          selection.point = transition;
-          selection.kind = ReplanStartKind::Transition;
-          selection.clearance = transition_clearance;
-          return selection;
-        }
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "重规划过渡起点被拒绝：过渡点安全距离=%.3f m，要求=%.3f m。",
-          transition_clearance, optimizer_config_.obstacle_cost_radius);
+          "重规划起点使用过渡继承：当前位置=(%.3f, %.3f)，继承点=(%.3f, %.3f)，过渡点=(%.3f, %.3f)，原偏差=%.3f m，新起点距机器人=%.3f m。",
+          current_position.x, current_position.y, inherited_position.x, inherited_position.y,
+          transition.x, transition.y, position_error, distance_2d(current_position, transition));
+        // 过渡点贴障不再在此处判否：硬通行性由端点 BFS 统一裁决，
+        // 软安全余量由连续代价场和优化器承担。
+        selection.point = transition;
+        selection.kind = ReplanStartKind::Transition;
+        selection.clearance = transition_clearance;
+        return selection;
       }
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
@@ -716,20 +653,13 @@ private:
       return selection;
     }
     if (inherited_clearance < optimizer_config_.obstacle_cost_radius) {
-      if (endpoint_projection_enabled_ && replan_start_allow_projection_when_unsafe_) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "重规划起点位置继承点安全距离不足，交由清障投影处理：距离=%.3f m，要求=%.3f m。",
-          inherited_clearance, optimizer_config_.obstacle_cost_radius);
-        selection.point = inherited_position;
-        selection.kind = ReplanStartKind::Inherited;
-        selection.clearance = inherited_clearance;
-        return selection;
-      }
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "重规划起点位置继承被拒绝：继承点安全距离=%.3f m，要求=%.3f m。",
+        "重规划起点继承点贴近障碍，交由端点 BFS 处理：距离=%.3f m，参考安全距离=%.3f m。",
         inherited_clearance, optimizer_config_.obstacle_cost_radius);
+      selection.point = inherited_position;
+      selection.kind = ReplanStartKind::Inherited;
+      selection.clearance = inherited_clearance;
       return selection;
     }
 
@@ -760,23 +690,11 @@ private:
       current_position.y + (inherited_position.y - current_position.y) * ratio_from_current};
   }
 
-  EndpointProjectorConfig make_endpoint_projector_config(
-    double clearance_hysteresis = 0.0,
-    bool allow_hysteresis_without_grid_free = false) const
-  {
-    EndpointProjectorConfig projector_config;
-    projector_config.required_clearance = optimizer_config_.obstacle_cost_radius;
-    projector_config.clearance_hysteresis = clearance_hysteresis;
-    projector_config.max_search_radius = endpoint_search_radius_;
-    projector_config.angle_samples = endpoint_angle_samples_;
-    projector_config.allow_hysteresis_without_grid_free = allow_hysteresis_without_grid_free;
-    return projector_config;
-  }
-
   std::vector<Point2D> restore_planning_endpoints(
-    const std::vector<Point2D> & jps_points, const Point2D & plan_start, const Point2D & plan_goal)
+    const std::vector<Point2D> & search_points, const Point2D & plan_start,
+    const Point2D & plan_goal)
   {
-    auto planning_points = jps_points;
+    auto planning_points = search_points;
     if (planning_points.size() < 2) {
       return planning_points;
     }
@@ -789,13 +707,13 @@ private:
     if (start_shift > 1.0e-4 || goal_shift > 1.0e-4) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "JPS 路径端点已恢复为连续规划端点：起点修正=%.3f m，目标修正=%.3f m。",
+        "前端路径端点已恢复为连续规划端点：起点修正=%.3f m，目标修正=%.3f m。",
         start_shift, goal_shift);
     }
     return planning_points;
   }
 
-  // 仅优化模式：不重跑 JPS，直接把上一轨迹从映射点到末端的前方部分按设定间距重采样，
+  // 仅优化模式：不重跑前端搜索，直接把上一轨迹从映射点到末端的前方部分按设定间距重采样，
   // 末点替换为本轮（重定位后的）目标点，作为 MINCO 两步优化的输入路点。
   // 对应报告 5.5.4.4“仅优化”分支：从重映射位置开始，按相同等时间间隔重新采样轨迹。
   std::vector<Point2D> resample_previous_forward(double mapped_t, const Point2D & plan_goal) const
@@ -898,13 +816,15 @@ private:
     for (int y = 0; y < grid.height; ++y) {
       for (int x = 0; x < grid.width; ++x) {
         const auto idx = static_cast<std::size_t>(y * grid.width + x);
-        grid.at(x, y) = msg.data[idx] > 50 ? 1 : 0;
+        // 输入是 0-100 语义的 OccupancyGrid；障碍格作为膨胀源写入满代价 255，
+        // 其余留 0，由后续连续膨胀填充软代价（Grid2D 为 0-255 代价场）。
+        grid.at(x, y) = msg.data[idx] > 50 ? 255 : 0;
       }
     }
     return grid;
   }
 
-  // BUG-4：把内部 Grid2D（JPS 搜索用的膨胀图）发布为 OccupancyGrid，几何沿用最新输入图 info。
+  // BUG-4：把内部 Grid2D（前端搜索用的连续代价场）发布为 OccupancyGrid，几何沿用最新输入图 info。
   void publish_grid_as_occupancy(const Grid2D & grid)
   {
     nav_msgs::msg::OccupancyGrid out;
@@ -915,7 +835,9 @@ private:
     for (int y = 0; y < grid.height; ++y) {
       for (int x = 0; x < grid.width; ++x) {
         const auto idx = static_cast<std::size_t>(y * grid.width + x);
-        out.data[idx] = grid.at(x, y) ? 100 : 0;
+        // 0-255 连续代价场按比例映射到 OccupancyGrid 的 0-100，便于 RViz 直接观察衰减带。
+        out.data[idx] = static_cast<std::int8_t>(
+          std::lround(static_cast<double>(grid.at(x, y)) * 100.0 / 255.0));
       }
     }
     inflated_grid_pub_->publish(out);
@@ -923,23 +845,18 @@ private:
 
   std::string odom_topic_;
   std::string obstacle_grid_topic_;
+  std::string dynamic_grid_topic_;
   std::string goal_topic_;
   std::string path_topic_;
   std::string map_frame_;
-  double robot_radius_{0.28};
-  double safety_margin_{0.18};
+  InflationParams inflation_params_{};
+  InflationParams dynamic_inflation_params_{};
   double replan_rate_hz_{5.0};
-  bool endpoint_projection_enabled_{true};
-  double endpoint_search_radius_{1.2};
-  int endpoint_angle_samples_{72};
-  bool local_goal_enabled_{true};
-  double local_goal_backoff_distance_{0.35};
-  double local_goal_sample_step_{0.1};
-  double local_goal_min_progress_distance_{0.35};
+  double endpoint_nudge_max_distance_{1.0};
+  double astar_obstacle_weight_{1.0};
+  int astar_max_expansions_{1000000};
   bool replan_start_position_inheritance_enabled_{true};
   double replan_start_max_position_error_{0.18};
-  bool replan_start_allow_projection_when_unsafe_{true};
-  double replan_start_clearance_hysteresis_{0.04};
   bool replan_start_transition_enabled_{true};
   double replan_start_transition_max_position_error_{0.36};
   double short_path_hold_distance_{0.25};
@@ -953,12 +870,11 @@ private:
   double replan_collision_clearance_{0.05};
   double replan_localization_deviation_threshold_{0.6};
   double replan_good_tracking_threshold_{0.25};
-  bool goal_reachability_enabled_{true};
-  double goal_reachability_search_radius_{1.5};
   bool publish_inflated_grid_{false};
   std::string inflated_grid_topic_;
   bool has_odom_{false};
   bool has_grid_{false};
+  bool has_dynamic_grid_{false};
   bool has_goal_{false};
   Pose2D pose_;
   Point2D goal_;
@@ -966,6 +882,7 @@ private:
   Point2D last_planned_goal_;
   bool has_last_planned_goal_{false};
   nav_msgs::msg::OccupancyGrid latest_grid_;
+  nav_msgs::msg::OccupancyGrid latest_dynamic_grid_;
   TrajectoryOptimizerConfig optimizer_config_{make_optimizer_config()};
   TrajectoryOptimizer optimizer_;
   bool has_previous_trajectory_{false};
@@ -976,6 +893,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr inflated_grid_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr dynamic_grid_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
 };
 

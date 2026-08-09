@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "astra_mapping/map_utils.hpp"
+
 namespace astra_nav
 {
 
@@ -42,39 +44,33 @@ Grid2D ObstacleExtractor::extract(const RollingOccupancyGrid3D & grid) const
       const double height = (last - first + 1) * grid.resolution();
       const double occupancy_ratio = (count * grid.resolution()) / std::max(height, grid.resolution());
       if (height >= config_.height_obstacle_min && occupancy_ratio >= config_.column_occupancy_min) {
-        output.at(ix, iy) = 1;
+        output.at(ix, iy) = 255;
       }
     }
   }
   return output;
 }
 
-Grid2D ObstacleExtractor::inflate(const Grid2D & input, int radius_cells)
+Grid2D ObstacleExtractor::inflate(const Grid2D & input, const InflationParams & params)
 {
-  if (radius_cells <= 0) {
+  if (input.width <= 0 || input.height <= 0) {
     return input;
   }
+
+  // 直接复用 HWSentryNav26 的膨胀实现（map_utils），本函数只做 Grid2D <-> cv::Mat 转接。
+  map_utils::MapInflationParams inflation_params;
+  inflation_params.full_cost_radius_m = params.full_cost_radius_m;
+  inflation_params.cutoff_radius_m = params.cutoff_radius_m;
+  inflation_params.decay_rate_per_m = params.decay_rate_per_m;
+  inflation_params.resolution = input.resolution;
+
   Grid2D output = input;
-  std::fill(output.data.begin(), output.data.end(), 0);
-  for (int x = 0; x < input.width; ++x) {
-    for (int y = 0; y < input.height; ++y) {
-      if (input.at(x, y) == 0) {
-        continue;
-      }
-      for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
-        for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
-          if (dx * dx + dy * dy > radius_cells * radius_cells) {
-            continue;
-          }
-          const int nx = x + dx;
-          const int ny = y + dy;
-          if (nx >= 0 && ny >= 0 && nx < input.width && ny < input.height) {
-            output.at(nx, ny) = 1;
-          }
-        }
-      }
-    }
-  }
+  // Grid2D 行主序 (y * width + x) 与 cv::Mat 行主序一致，可零拷贝包装。
+  const cv::Mat source(
+    input.height, input.width, CV_8UC1, const_cast<std::uint8_t *>(input.data.data()));
+  const cv::Mat inflated = map_utils::inflate_cost_map_bounded(source, inflation_params);
+  std::copy(
+    inflated.begin<std::uint8_t>(), inflated.end<std::uint8_t>(), output.data.begin());
   return output;
 }
 

@@ -38,31 +38,30 @@ inline double grad_time_to_tau(double tau)
   return (1.0 - tau) / (den * den);
 }
 
-// 软约束惩罚：当 violation>0 时返回三次罚函数及其对 violation 的导数。
-// 采用三次罚 (violation^3) 使代价 C2 连续，利于 L-BFGS 线搜索稳定。
-inline void cubic_penalty(double violation, double & cost, double & grad)
+// 越界距离斜坡的正则化尺度，对齐 HWSentryNav26 minco_optimizer 的 EPS。
+constexpr double kCostRampEps = 1.0e-9;
+
+// 把点夹回代价图足迹，对齐 HWSentryNav26 GridGeometry::clamp_to_footprint。
+inline Eigen::Vector2d clamp_to_footprint(const Grid2D & cost_map, const Eigen::Vector2d & point)
 {
-  if (violation <= 0.0) {
-    cost = 0.0;
-    grad = 0.0;
-    return;
-  }
-  cost = violation * violation * violation;
-  grad = 3.0 * violation * violation;
+  const Eigen::Vector2d origin(cost_map.origin.x, cost_map.origin.y);
+  const Eigen::Vector2d footprint_max = origin + cost_map.resolution *
+    Eigen::Vector2d(cost_map.width, cost_map.height);
+  return point.cwiseMax(origin).cwiseMin(footprint_max);
 }
 
 // 优化上下文：在 L-BFGS 回调之间传递所有不变量与中间缓存。
 struct OptimizeContext
 {
   const MincoOptimizerConfig * config{nullptr};
-  const EsdfMap * esdf{nullptr};
+  // 障碍罚直接采样与前端 A* 同源的 0-255 连续代价场，不再走 ESDF 距离场。
+  const Grid2D * cost_map{nullptr};
   MincoOptimizeStage stage{MincoOptimizeStage::PreOptimization};
   int piece_count{0};
   Eigen::Matrix<double, 2, 3> head;
   Eigen::Matrix<double, 2, 3> tail;
   minco::MINCO_S3NU * minco{nullptr};
   int iterations{0};
-  int valley_hits{0};
 };
 
 // 把优化变量 x 拆为内部路标点 P(2 x (N-1)) 与虚拟时间 tau(N)。
@@ -127,71 +126,37 @@ double accumulate_penalty(
       // dCost/dt 的“显式”部分（采样点时间随 s=step*j 移动带来的链式项）。
       double grad_pt = 0.0;
 
-      // ---- 障碍软约束 ----
-      const auto query = ctx.esdf->query_distance_and_gradient(pos.x(), pos.y());
-      const double distance = query.first;
-      Eigen::Vector2d esdf_grad(query.second.x, query.second.y);
-      const double violation = cfg.safe_distance - distance;
-      if (violation > 0.0 && ctx.esdf->in_map(pos.x(), pos.y())) {
-        double pen = 0.0;
-        double pen_grad = 0.0;
-        cubic_penalty(violation, pen, pen_grad);
-
-        // 代价对位置的梯度（L-BFGS 需要 dCost/dpos，会自行沿负梯度下降）：
-        //   cost = w * pen(violation), violation = safe - distance
-        //   d(cost)/dpos = w * pen_grad * d(violation)/dpos = w * pen_grad * (-esdf_grad)
-        // 即 dCost/dpos = -w * pen_grad * esdf_grad（指向障碍内部，负梯度方向即推离障碍）。
-        Eigen::Vector2d cost_grad = -cfg.weight_obstacle * pen_grad * esdf_grad;
-        if (ctx.stage == MincoOptimizeStage::FinelyOptimization) {
-          // 报告 5.5.4.2 FINELY 阶段：不产生沿速度方向的梯度，并对“梯度无效化”的
-          // 势谷做特殊处理。流程严格对应报告：
-          //   1) 把避障梯度（这里用 ESDF 梯度 esdf_grad，指向障碍外）扣除沿轨迹
-          //      （速度）方向的分量，得到法向梯度 gradPos；
-          //   2) 把 gradPos 归一化到正常水准（单障碍下一个 step 最多让 ESDF 增大一个
-          //      step，故归一化到模长 1）；
-          //   3) 沿 gradPos 方向探一步（步长取一个 Cell），用探测点 ESDF 与当前点 ESDF
-          //      估计该方向上的“有效梯度”；
-          //   4) 若有效梯度接近 1，说明此方向可自由移动，正常按 ESDF 梯度避障；
-          //   5) 若有效梯度 < 阈值（报告取 0.5），认为该点将被优化到势谷（梯度无效化：
-          //      两侧障碍等距、中线无梯度），改用 violaPos 作为避障梯度方向——
-          //      大小取 valley_scale*sqrt(gradPos.norm())（二次插值梯度值反映距峰谷距离），
-          //      方向用 gradPos，避免控制点卡在峡谷中线优化不动。
-          const double speed = vel.norm();
-          Eigen::Vector2d normal_grad = esdf_grad;  // 法向避障梯度（报告 gradPos）
-          if (speed > 1.0e-6) {
-            const Eigen::Vector2d tangent = vel / speed;
-            normal_grad -= normal_grad.dot(tangent) * tangent;  // 扣除切向，仅保留法向
+      // ---- 障碍软约束（直接复制 HWSentryNav26 minco_optimizer 的采样点障碍罚）----
+      // 罚 = w * 0.5 * value²，value = 归一化连续代价场采样值（0-1），梯度为解析双线性梯度。
+      // 越界时在被复制的边界值之上叠加距离斜坡，而不是替换为常数 1 + d/res ——
+      // 后者会在 footprint 边界让自由区的罚从 ≈0 阶跃到满值。
+      if (ctx.cost_map != nullptr && cfg.weight_obstacle > 0.0) {
+        const CostSample cost_sample =
+          sample_cost_map_clamped(*ctx.cost_map, Point2D{pos.x(), pos.y()});
+        double value = cost_sample.value / 255.0;
+        Eigen::Vector2d value_gradient(
+          cost_sample.gradient.x / 255.0, cost_sample.gradient.y / 255.0);
+        const Eigen::Vector2d clamped = clamp_to_footprint(*ctx.cost_map, pos);
+        const Eigen::Vector2d delta = pos - clamped;
+        const double outside_squared = delta.squaredNorm();
+        if (outside_squared > 0.0) {
+          // 斜坡取 d²/(2·res·reg)（d<reg）与 d−reg/2 的 C1 拼接：边界处
+          // 值与梯度都为 0，避免 sqrt 在 d→0 处的无界导数与常数偏置。
+          const double regularization = kCostRampEps;
+          const double distance = std::sqrt(outside_squared);
+          const double resolution = ctx.cost_map->resolution;
+          if (distance < regularization) {
+            value += 0.5 * outside_squared / (resolution * regularization);
+            value_gradient += delta / (resolution * regularization);
+          } else {
+            value += (distance - 0.5 * regularization) / resolution;
+            value_gradient += delta / (distance * resolution);
           }
-          const double grad_pos_norm = normal_grad.norm();
-          Eigen::Vector2d avoid_dir = Eigen::Vector2d::Zero();
-          if (grad_pos_norm > 1.0e-9) {
-            const Eigen::Vector2d grad_pos_unit = normal_grad / grad_pos_norm;
-            // 沿 gradPos 方向探一步（一个 Cell），估计有效梯度。
-            const double step = ctx.esdf->resolution();
-            const Eigen::Vector2d probe = pos + grad_pos_unit * step;
-            double effective_gradient = 1.0;
-            if (ctx.esdf->in_map(probe.x(), probe.y())) {
-              const double probe_distance = ctx.esdf->query_distance(probe.x(), probe.y());
-              // 有效梯度 = 沿探测方向单位步长上的距离增量（理想自由移动时应接近 1）。
-              effective_gradient = (probe_distance - distance) / std::max(step, 1.0e-9);
-            }
-            if (effective_gradient < cfg.valley_gradient_threshold) {
-              // 势谷分支：梯度无效化，改用 violaPos 方向与幅度。
-              ctx.valley_hits += 1;
-              const double viola_mag = cfg.valley_scale * std::sqrt(grad_pos_norm);
-              avoid_dir = viola_mag * grad_pos_unit;
-            } else {
-              // 正常分支：沿法向 ESDF 梯度避障。
-              avoid_dir = normal_grad;
-            }
-          }
-          // dCost/dpos = -w * pen_grad * avoid_dir（负梯度方向即把控制点推离障碍）。
-          cost_grad = -cfg.weight_obstacle * pen_grad * avoid_dir;
         }
-        const double w = cfg.weight_obstacle;
-        cost += omega * w * pen;
-        grad_pos += omega * cost_grad;
-        point_cost += omega * w * pen;
+        const double obstacle = cfg.weight_obstacle * 0.5 * value * value;
+        cost += omega * obstacle;
+        grad_pos += omega * cfg.weight_obstacle * value * value_gradient;
+        point_cost += omega * obstacle;
       }
 
       // ---- 速度软约束 ----
@@ -270,8 +235,6 @@ double lbfgs_cost(void * ptr, const Eigen::VectorXd & x, Eigen::VectorXd & grad)
 {
   auto & ctx = *static_cast<OptimizeContext *>(ptr);
   ctx.iterations += 1;
-  // 每次代价评估重置势谷命中计数，使其反映最后一次（最终轨迹）的势谷采样点数。
-  ctx.valley_hits = 0;
   const auto & cfg = *ctx.config;
 
   Eigen::MatrixXd inner_points;
@@ -341,7 +304,7 @@ MincoOptimizer::MincoOptimizer(const MincoOptimizerConfig & config)
 MincoOptimizerResult MincoOptimizer::optimize(
   const std::vector<Point2D> & waypoints, const std::vector<double> & times,
   const MincoBoundaryState & head, const MincoBoundaryState & tail,
-  const EsdfMap & esdf, MincoOptimizeStage stage) const
+  const Grid2D & cost_map, MincoOptimizeStage stage) const
 {
   MincoOptimizerResult result;
   const int piece_count = static_cast<int>(waypoints.size()) - 1;
@@ -376,7 +339,7 @@ MincoOptimizerResult MincoOptimizer::optimize(
 
   OptimizeContext ctx;
   ctx.config = &config_;
-  ctx.esdf = &esdf;
+  ctx.cost_map = &cost_map;
   ctx.stage = stage;
   ctx.piece_count = piece_count;
   ctx.head = head_state;
@@ -400,12 +363,6 @@ MincoOptimizerResult MincoOptimizer::optimize(
   result.status = lbfgs::lbfgs_optimize(x, final_cost, lbfgs_cost, nullptr, nullptr, &ctx, params);
   result.iterations = ctx.iterations;
   result.final_cost = final_cost;
-  // 在最终解 x 上再评估一次，刷新势谷命中计数，使其对应最终轨迹（报告 5.5.4.2 可观测指标）。
-  {
-    Eigen::VectorXd grad_final(x.size());
-    lbfgs_cost(&ctx, x, grad_final);
-    result.valley_hits = ctx.valley_hits;
-  }
 
   // 用优化结果构造最终轨迹（经适配层，保持外部接口一致）。
   Eigen::MatrixXd inner_points;

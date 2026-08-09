@@ -42,7 +42,6 @@ struct TrajectoryOptimizerConfig
   double minco_weight_velocity{200.0};
   double minco_weight_acceleration{200.0};
   double minco_weight_uniform_time{120.0};
-  double minco_valley_gradient_threshold{0.5};
   int minco_samples_per_piece{16};
   int minco_pre_iterations{60};
   int minco_fine_iterations{60};
@@ -100,8 +99,6 @@ struct TrajectoryOptimizationStats
   int time_scaling_iterations{0};
   double time_scaling_factor{1.0};
   bool used_minco_backend{false};
-  // FINELY 阶段势谷分支命中的采样点次数（报告 5.5.4.2 梯度无效化处理，可观测指标）。
-  int finely_valley_hits{0};
   // —— 回环检测诊断（轨迹中段甩圈/绕圈）——
   bool loop_detected{false};          // 最终输出轨迹是否仍含回环
   bool loop_recovered{false};         // 是否通过回退 PRE / 撤销缩放消除了回环
@@ -121,11 +118,16 @@ class TrajectoryOptimizer
 {
 public:
   explicit TrajectoryOptimizer(const TrajectoryOptimizerConfig & config);
-  MincoTrajectory optimize(const std::vector<Point2D> & coarse_path, const EsdfMap & esdf) const;
+  // cost_map 是与前端 A* 同源的 0-255 连续代价场，供 MINCO 障碍罚直接双线性采样；
+  // esdf 仍用于路点级回退后端、轨迹质量指标与时间缩放的安全距离评估。
+  MincoTrajectory optimize(
+    const std::vector<Point2D> & coarse_path, const Grid2D & cost_map,
+    const EsdfMap & esdf) const;
   TrajectoryOptimizationResult optimize_with_stats(
-    const std::vector<Point2D> & coarse_path, const EsdfMap & esdf) const;
+    const std::vector<Point2D> & coarse_path, const Grid2D & cost_map,
+    const EsdfMap & esdf) const;
   TrajectoryOptimizationResult optimize_with_stats(
-    const std::vector<Point2D> & coarse_path, const EsdfMap & esdf,
+    const std::vector<Point2D> & coarse_path, const Grid2D & cost_map, const EsdfMap & esdf,
     const TrajectoryBoundaryCondition & boundary_condition) const;
 
 private:
@@ -137,7 +139,7 @@ private:
     const TrajectoryBoundaryCondition & boundary_condition) const;
   // 基于 MINCO 控制点/分段时间梯度的两步后端优化主流程（报告 5.5.4）。
   TrajectoryOptimizationResult optimize_minco_backend(
-    const std::vector<Point2D> & waypoints, const EsdfMap & esdf,
+    const std::vector<Point2D> & waypoints, const Grid2D & cost_map, const EsdfMap & esdf,
     const TrajectoryBoundaryCondition & boundary_condition) const;
   // 对已优化轨迹做双向时间缩放，使巡航速度收敛到 max_velocity（受 max_acceleration 约束）。
   // 这一步把“轨迹形状”（由 MINCO 两步优化决定）与“轨迹速度”（由此处对时间整体缩放决定）

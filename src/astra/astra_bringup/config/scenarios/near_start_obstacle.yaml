@@ -11,5 +11,6 @@ sim_world_node:
 
 planner_node:
   ros__parameters:
-    endpoint_search_radius: 1.5
+    # 起点埋在障碍里时靠 endpoint_nudge 的 BFS 重定位救回，半径给宽一些。
+    endpoint_nudge_max_distance: 1.5
 

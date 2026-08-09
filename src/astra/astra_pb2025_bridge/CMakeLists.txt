@@ -15,9 +15,14 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+# 动态障碍多级过滤：OpenCV 连通域分析 + PCL 统计离群点过滤。
+find_package(OpenCV REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common filters)
 
-# 全局障碍图节点：融合先验 /map + 实时 terrain_map -> 全场障碍图（供 Astra 全局规划）。
+# 全局障碍图节点：先验 /map(静态层) + 实时 terrain_map(动态层) -> 两层全场障碍图（供 Astra 全局规划）。
 add_executable(global_obstacle_map_node src/global_obstacle_map_node.cpp)
+target_include_directories(global_obstacle_map_node PRIVATE ${PCL_INCLUDE_DIRS})
+target_link_libraries(global_obstacle_map_node ${OpenCV_LIBS} ${PCL_LIBRARIES})
 ament_target_dependencies(global_obstacle_map_node
   rclcpp nav_msgs sensor_msgs geometry_msgs tf2 tf2_ros)
 install(TARGETS global_obstacle_map_node DESTINATION lib/${PROJECT_NAME})
